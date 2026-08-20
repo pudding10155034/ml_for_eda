@@ -129,6 +129,34 @@ def simulate_search(
     min_steps_before_stopping: int = 2,
 ) -> SimulationResult:
     oracle = load_oracle_trajectories(dataset, circuit_id)
+    return simulate_search_from_oracle(
+        oracle,
+        model,
+        budget=budget,
+        seed=seed,
+        min_steps_before_stopping=min_steps_before_stopping,
+    )
+
+
+def simulate_search_from_oracle(
+    oracle: Sequence[Trajectory],
+    model: RiskModel,
+    *,
+    budget: int,
+    seed: int = 0,
+    min_steps_before_stopping: int = 2,
+) -> SimulationResult:
+    """Simulate search using an in-memory oracle trajectory set.
+
+    Experiment sweeps use this entry point to parse each holdout dataset once
+    and reuse it across budgets and random seeds.
+    """
+    if not oracle:
+        raise ValueError("oracle must contain at least one trajectory")
+    circuit_ids = {trajectory.circuit_id for trajectory in oracle}
+    if len(circuit_ids) != 1:
+        raise ValueError("oracle trajectories must belong to exactly one circuit")
+    circuit_id = next(iter(circuit_ids))
     by_recipe = {trajectory.recipe_id: trajectory for trajectory in oracle}
     recipes = [
         Recipe(trajectory.recipe_id, trajectory.operations) for trajectory in oracle

@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "name": "epfl_pilot",
+  "project_root": "..",
+  "output_dir": "artifacts/experiments/epfl_pilot",
+  "abc": ".tools/abc",
+  "circuits": [
+    "data/epfl/arithmetic/adder.aig",
+    "data/epfl/arithmetic/bar.aig",
+    "data/epfl/random_control/cavlc.aig",
+    "data/epfl/random_control/ctrl.aig",
+    "data/epfl/random_control/router.aig"
+  ],
+  "recipes": {
+    "count": 24,
+    "length": 6,
+    "seeds": [7],
+    "max_consecutive": 2
+  },
+  "collection": {
+    "jobs": 2,
+    "timeout_s": 120.0
+  },
+  "training": {
+    "alpha": 0.1,
+    "trees": 64,
+    "min_samples_leaf": 2,
+    "calibration_fraction": 0.25,
+    "model_jobs": 2
+  },
+  "evaluation": {
+    "budgets": [5, 10],
+    "search_seeds": [0, 1],
+    "min_stop_step": 2
+  }
+}

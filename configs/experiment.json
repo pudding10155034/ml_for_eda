@@ -1,18 +1,45 @@
 {
+  "schema_version": 1,
+  "name": "epfl_full",
   "research_question": "Risk-aware budgeted search for logic synthesis under limited ABC evaluations",
-  "candidate_recipes": 500,
-  "recipe_length": 10,
-  "evaluation_budgets": [10, 20, 50],
-  "risk_alpha": 0.01,
+  "split": "leave-one-circuit-out",
   "qor_weights": {
     "nodes": 0.5,
     "depth": 0.5
   },
-  "split": "leave-one-circuit-out",
   "primary_metrics": [
     "best_qor_vs_cpu_seconds",
     "relative_gap_to_oracle_percent",
     "runtime_reduction_vs_random_percent",
     "simultaneous_trajectory_coverage"
-  ]
+  ],
+  "project_root": "..",
+  "output_dir": "artifacts/experiments/epfl_full",
+  "abc": ".tools/abc",
+  "circuits": [
+    "data/epfl/arithmetic",
+    "data/epfl/random_control"
+  ],
+  "recipes": {
+    "count": 500,
+    "length": 10,
+    "seeds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+    "max_consecutive": 2
+  },
+  "collection": {
+    "jobs": 2,
+    "timeout_s": 120.0
+  },
+  "training": {
+    "alpha": 0.01,
+    "trees": 200,
+    "min_samples_leaf": 2,
+    "calibration_fraction": 0.25,
+    "model_jobs": 2
+  },
+  "evaluation": {
+    "budgets": [10, 20, 50],
+    "search_seeds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+    "min_stop_step": 2
+  }
 }

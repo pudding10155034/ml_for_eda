@@ -34,12 +34,12 @@ printf '\n'
 
 printf 'Native toolchain\n'
 python3 --version
-gcc --version | head -n 1
-g++ --version | head -n 1
-make --version | head -n 1
+gcc --version | sed -n '1p'
+g++ --version | sed -n '1p'
+make --version | sed -n '1p'
 git --version
 if command -v cmake >/dev/null 2>&1; then
-  cmake --version | head -n 1
+  cmake --version | sed -n '1p'
 else
   printf 'cmake: not installed (optional; current ABC build uses Make)\n'
 fi

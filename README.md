@@ -21,6 +21,7 @@ logic-synthesis recipe，並以具校準區間的 surrogate model 同時決定�
   sequential early stopping。
 - Optimistic lower-bound selection、safe elimination 與 risk-aware early stopping。
 - Held-out circuit oracle replay，可在不用重新執行 ABC 的情況下快速做 ablation。
+- 具 shard checkpoint、設定 fingerprint 與原子 metadata 的可續跑實驗 runner。
 - Synthetic end-to-end demo 與單元測試。
 
 ## QoR 定義
@@ -52,6 +53,18 @@ logic-synthesis recipe，並以具校準區間的 surrogate model 同時決定�
 
 輸出包含 recipes、synthetic trajectory dataset、校準後模型、training report 與
 held-out circuit simulation。
+
+真實 ABC 小規模 pilot 可直接執行，若中斷後重下同一指令會從最後完成的 shard、
+模型或 simulation 繼續：
+
+    make pilot
+
+完整研究設定先用 dry-run 檢查工作量：
+
+    make experiment-plan
+
+runner 的輸出結構、checkpoint 判定與分階段指令請見
+[docs/EXPERIMENTS.md](docs/EXPERIMENTS.md)。
 
 ## 安裝 Berkeley ABC 與取得小型 EPFL 子集
 
@@ -135,6 +148,7 @@ family shift 分層報告。
       model.py         forest surrogate + conformal calibration
       search.py        selection、elimination、early stopping
       simulation.py    held-out oracle replay
+      experiment.py    可續跑的 sharded experiment runner
       synthetic.py     可重現的開發用 oracle
       cli.py           命令列入口
 

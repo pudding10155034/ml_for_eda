@@ -8,6 +8,7 @@ from typing import Any, Sequence
 
 from .abc_runner import ABCRunner, iter_circuit_files
 from .dataset import collect_abc_trajectories, write_trajectories
+from .experiment import ExperimentRunner, load_experiment_config
 from .model import RiskModel, train_risk_model
 from .recipes import DEFAULT_OPERATORS, generate_recipes, load_recipes, save_recipes
 from .search import run_live_search
@@ -101,6 +102,7 @@ def _command_train(args: argparse.Namespace) -> dict[str, object]:
         n_estimators=args.trees,
         min_samples_leaf=args.min_samples_leaf,
         seed=args.seed,
+        n_jobs=args.model_jobs,
     )
     model.save(args.output)
     payload = report.to_dict()
@@ -108,6 +110,24 @@ def _command_train(args: argparse.Namespace) -> dict[str, object]:
     if args.report:
         _write_json(payload, args.report)
     return payload
+
+
+def _command_experiment(args: argparse.Namespace) -> dict[str, object]:
+    config = load_experiment_config(
+        args.config,
+        output_dir=args.output,
+        jobs=args.jobs,
+    )
+
+    def progress(message: str) -> None:
+        print(f"[experiment] {message}", file=sys.stderr, flush=True)
+
+    runner = ExperimentRunner(
+        config,
+        resume=args.resume,
+        progress=progress,
+    )
+    return runner.run(phase=args.phase, dry_run=args.dry_run)
 
 
 def _command_simulate(args: argparse.Namespace) -> dict[str, object]:
@@ -251,7 +271,33 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--trees", type=int, default=200)
     train.add_argument("--min-samples-leaf", type=int, default=2)
     train.add_argument("--seed", type=int, default=0)
+    train.add_argument(
+        "--model-jobs",
+        type=int,
+        default=-1,
+        help="parallel workers used by the random forest (-1 uses all CPUs)",
+    )
     train.set_defaults(handler=_command_train)
+
+    experiment = subparsers.add_parser(
+        "experiment",
+        help="run a resumable collection, LOCO training, and evaluation sweep",
+    )
+    experiment.add_argument("--config", required=True)
+    experiment.add_argument("--output", help="override the configured output directory")
+    experiment.add_argument(
+        "--phase",
+        choices=("all", "collect", "train", "evaluate"),
+        default="all",
+    )
+    experiment.add_argument("--resume", action="store_true")
+    experiment.add_argument("--dry-run", action="store_true")
+    experiment.add_argument(
+        "--jobs",
+        type=int,
+        help="override the number of concurrent ABC collection workers",
+    )
+    experiment.set_defaults(handler=_command_experiment)
 
     simulate = subparsers.add_parser(
         "simulate", help="replay a held-out circuit as a zero-cost oracle"

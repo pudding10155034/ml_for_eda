@@ -1,7 +1,7 @@
 PYTHON := .venv/bin/python
 CLI := .venv/bin/riskaware-eda
 
-.PHONY: help bootstrap env test check demo abc epfl organize
+.PHONY: help bootstrap env test check demo pilot experiment-plan abc epfl organize
 
 help:
 	@printf '%s\n' \
@@ -10,6 +10,8 @@ help:
 	  'make test       Run the unit test suite' \
 	  'make check      Run environment checks and tests' \
 	  'make demo       Run the synthetic end-to-end pipeline' \
+	  'make pilot      Run or resume the small real-ABC pilot experiment' \
+	  'make experiment-plan  Validate and print the full experiment plan' \
 	  'make abc        Build/update Berkeley ABC' \
 	  'make epfl       Fetch the 20 small EPFL AIGER circuits' \
 	  'make organize   Archive obsolete envs and organize generated files'
@@ -27,6 +29,12 @@ check: env test
 
 demo:
 	$(CLI) demo --output artifacts/demo
+
+pilot:
+	$(CLI) experiment --config configs/pilot_experiment.json --resume
+
+experiment-plan:
+	$(CLI) experiment --config configs/experiment.json --dry-run
 
 abc:
 	bash scripts/setup_abc.sh

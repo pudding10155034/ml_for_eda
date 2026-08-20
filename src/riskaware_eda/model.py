@@ -96,6 +96,17 @@ class RiskModel:
     def predict_trajectory(self, trajectory: Trajectory) -> Prediction:
         return self.predict_vectors(self.encoder.encode_trajectory(trajectory))[0]
 
+    def predict_trajectories(
+        self, trajectories: Sequence[Trajectory]
+    ) -> list[Prediction]:
+        """Predict several trajectory prefixes in one forest traversal."""
+        if not trajectories:
+            return []
+        matrix = np.vstack(
+            [self.encoder.encode_trajectory(trajectory) for trajectory in trajectories]
+        )
+        return self.predict_vectors(matrix)
+
     def save(self, destination: str | Path) -> None:
         path = Path(destination)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -150,6 +161,7 @@ def train_risk_model(
     n_estimators: int = 200,
     min_samples_leaf: int = 2,
     seed: int = 0,
+    n_jobs: int = -1,
 ) -> tuple[RiskModel, TrainingReport]:
     if not 0 < alpha < 1:
         raise ValueError("alpha must be between zero and one")
@@ -157,6 +169,8 @@ def train_risk_model(
         raise ValueError("calibration_fraction must be between zero and one")
     if n_estimators < 10:
         raise ValueError("n_estimators must be at least 10")
+    if n_jobs == 0:
+        raise ValueError("n_jobs must be non-zero")
 
     rows = _complete_prefix_rows(read_dataset(dataset))
     excluded = set(excluded_circuits)
@@ -193,7 +207,7 @@ def train_risk_model(
         n_estimators=n_estimators,
         min_samples_leaf=min_samples_leaf,
         max_features=0.8,
-        n_jobs=-1,
+        n_jobs=n_jobs,
         random_state=seed,
     )
     forest.fit(x_train, y_train)

@@ -97,20 +97,6 @@ class RiskAwareSearcher:
         self.min_steps_before_stopping = min_steps_before_stopping
         self.weights = weights
 
-    def _start_prediction(
-        self,
-        circuit_id: str,
-        initial: NetworkStats,
-        recipe: Recipe,
-    ) -> Prediction:
-        state = Trajectory(
-            circuit_id=circuit_id,
-            recipe_id=recipe.recipe_id,
-            operations=recipe.operations,
-            initial=initial,
-        )
-        return self.model.predict_trajectory(state)
-
     def run(
         self,
         *,
@@ -128,10 +114,18 @@ class RiskAwareSearcher:
 
         rng = random.Random(self.seed)
         remaining = {recipe.recipe_id: recipe for recipe in recipes}
-        predictions = {
-            recipe.recipe_id: self._start_prediction(circuit_id, initial, recipe)
+        start_states = [
+            Trajectory(
+                circuit_id=circuit_id,
+                recipe_id=recipe.recipe_id,
+                operations=recipe.operations,
+                initial=initial,
+            )
             for recipe in recipes
-        }
+        ]
+        predictions = dict(
+            zip(recipe_ids, self.model.predict_trajectories(start_states), strict=True)
+        )
         result = SearchResult(
             circuit_id=circuit_id,
             budget=self.budget,
