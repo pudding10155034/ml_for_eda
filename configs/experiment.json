@@ -1,0 +1,18 @@
+{
+  "research_question": "Risk-aware budgeted search for logic synthesis under limited ABC evaluations",
+  "candidate_recipes": 500,
+  "recipe_length": 10,
+  "evaluation_budgets": [10, 20, 50],
+  "risk_alpha": 0.01,
+  "qor_weights": {
+    "nodes": 0.5,
+    "depth": 0.5
+  },
+  "split": "leave-one-circuit-out",
+  "primary_metrics": [
+    "best_qor_vs_cpu_seconds",
+    "relative_gap_to_oracle_percent",
+    "runtime_reduction_vs_random_percent",
+    "simultaneous_trajectory_coverage"
+  ]
+}

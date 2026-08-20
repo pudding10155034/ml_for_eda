@@ -1,0 +1,21 @@
+# Python build and test caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local Python runtimes
+.venv/
+.venv-linux/
+.uv-cache/
+.uv-python/
+
+# Locally compiled tools and generated research data
+.tools/
+artifacts/
+data/
+
+# Berkeley ABC local history
+abc.history

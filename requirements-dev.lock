@@ -1,0 +1,17 @@
+# Tested dependency set for Python 3.10 on WSL Ubuntu 22.04.
+# Regenerate deliberately after dependency updates; do not use pip freeze blindly.
+coverage==7.15.4
+exceptiongroup==1.3.1
+iniconfig==2.3.0
+joblib==1.5.3
+numpy==2.2.6
+packaging==26.3
+pluggy==1.6.0
+Pygments==2.21.0
+pytest==8.4.2
+pytest-cov==6.3.0
+scikit-learn==1.7.2
+scipy==1.15.3
+threadpoolctl==3.6.0
+tomli==2.4.1
+typing_extensions==4.16.0

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "riskaware-eda"
+version = "0.1.0"
+description = "Risk-aware budgeted search and early stopping for ABC logic synthesis recipes"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Risk-Aware EDA Research Project" }]
+dependencies = [
+  "joblib>=1.3,<2",
+  "numpy>=1.24,<3",
+  "scikit-learn>=1.3,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.4,<9",
+  "pytest-cov>=4.1,<7",
+]
+
+[project.scripts]
+riskaware-eda = "riskaware_eda.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
