@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import asdict, dataclass, field
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 
 from .model import Prediction, RiskModel
 from .qor import QoRWeights, normalized_qor
@@ -73,6 +73,27 @@ class SearchResult:
 
 
 Evaluator = Callable[[Recipe, StopCallback | None], Trajectory]
+TrajectoryPredictor = Callable[[Trajectory], Prediction]
+
+
+def _snapshot_result(
+    source: SearchResult,
+    *,
+    budget: int,
+    termination_reason: str,
+) -> SearchResult:
+    """Copy the mutable search state at an exact budget boundary."""
+    return SearchResult(
+        circuit_id=source.circuit_id,
+        budget=budget,
+        risk_alpha=source.risk_alpha,
+        evaluations=list(source.evaluations),
+        best_recipe_id=source.best_recipe_id,
+        best_qor=source.best_qor,
+        setup_runtime_s=source.setup_runtime_s,
+        candidates_eliminated=source.candidates_eliminated,
+        termination_reason=termination_reason,
+    )
 
 
 class RiskAwareSearcher:
@@ -105,35 +126,89 @@ class RiskAwareSearcher:
         recipes: Sequence[Recipe],
         evaluator: Evaluator,
         setup_runtime_s: float = 0.0,
+        start_predictions: Mapping[str, Prediction] | None = None,
+        predict_trajectory: TrajectoryPredictor | None = None,
     ) -> SearchResult:
+        return self.run_budgets(
+            circuit_id=circuit_id,
+            initial=initial,
+            recipes=recipes,
+            evaluator=evaluator,
+            budgets=(self.budget,),
+            setup_runtime_s=setup_runtime_s,
+            start_predictions=start_predictions,
+            predict_trajectory=predict_trajectory,
+        )[self.budget]
+
+    def run_budgets(
+        self,
+        *,
+        circuit_id: str,
+        initial: NetworkStats,
+        recipes: Sequence[Recipe],
+        evaluator: Evaluator,
+        budgets: Sequence[int],
+        setup_runtime_s: float = 0.0,
+        start_predictions: Mapping[str, Prediction] | None = None,
+        predict_trajectory: TrajectoryPredictor | None = None,
+    ) -> dict[int, SearchResult]:
+        """Run once and snapshot results at multiple exact budget boundaries.
+
+        Elimination is evaluated at the start of the next search iteration. A
+        snapshot is consequently taken immediately after the matching
+        evaluation and before a larger budget is allowed to eliminate more
+        candidates. This preserves the behavior of independent budget runs.
+        """
         if not recipes:
             raise ValueError("candidate recipes cannot be empty")
+        requested_budgets = tuple(sorted(set(int(item) for item in budgets)))
+        if not requested_budgets:
+            raise ValueError("at least one budget is required")
+        if requested_budgets[0] < 1:
+            raise ValueError("budgets must be positive")
+        if requested_budgets[-1] > self.budget:
+            raise ValueError("requested budget exceeds searcher budget")
         recipe_ids = [recipe.recipe_id for recipe in recipes]
         if len(recipe_ids) != len(set(recipe_ids)):
             raise ValueError("candidate recipe IDs must be unique")
 
         rng = random.Random(self.seed)
         remaining = {recipe.recipe_id: recipe for recipe in recipes}
-        start_states = [
-            Trajectory(
-                circuit_id=circuit_id,
-                recipe_id=recipe.recipe_id,
-                operations=recipe.operations,
-                initial=initial,
+        if start_predictions is None:
+            start_states = [
+                Trajectory(
+                    circuit_id=circuit_id,
+                    recipe_id=recipe.recipe_id,
+                    operations=recipe.operations,
+                    initial=initial,
+                )
+                for recipe in recipes
+            ]
+            predictions = dict(
+                zip(
+                    recipe_ids,
+                    self.model.predict_trajectories(start_states),
+                    strict=True,
+                )
             )
-            for recipe in recipes
-        ]
-        predictions = dict(
-            zip(recipe_ids, self.model.predict_trajectories(start_states), strict=True)
-        )
+        else:
+            missing = [item for item in recipe_ids if item not in start_predictions]
+            if missing:
+                raise ValueError(
+                    f"start predictions missing recipe IDs: {missing[:3]}"
+                )
+            predictions = {item: start_predictions[item] for item in recipe_ids}
+        predictor = predict_trajectory or self.model.predict_trajectory
         result = SearchResult(
             circuit_id=circuit_id,
-            budget=self.budget,
+            budget=requested_budgets[-1],
             risk_alpha=self.model.alpha,
             setup_runtime_s=setup_runtime_s,
         )
+        snapshots: dict[int, SearchResult] = {}
+        requested_set = set(requested_budgets)
 
-        while remaining and len(result.evaluations) < self.budget:
+        while remaining and len(result.evaluations) < requested_budgets[-1]:
             if result.best_qor is not None:
                 eliminated = [
                     recipe_id
@@ -159,14 +234,13 @@ class RiskAwareSearcher:
                     ),
                 )
             recipe = remaining.pop(recipe_id)
-            incumbent_before = result.best_qor
 
             def stop_callback(partial: Trajectory) -> str | None:
                 if result.best_qor is None:
                     return None
                 if len(partial.steps) < self.min_steps_before_stopping:
                     return None
-                prediction = self.model.predict_trajectory(partial)
+                prediction = predictor(partial)
                 if prediction.lower > result.best_qor:
                     return "conformal_lower_bound_above_incumbent"
                 return None
@@ -181,7 +255,7 @@ class RiskAwareSearcher:
                     result.best_qor = observed_qor
                     result.best_recipe_id = recipe.recipe_id
             end_prediction = (
-                self.model.predict_trajectory(trajectory) if trajectory.steps else None
+                predictor(trajectory) if trajectory.steps else None
             )
             result.evaluations.append(
                 EvaluationRecord(
@@ -200,9 +274,29 @@ class RiskAwareSearcher:
                 )
             )
 
+            selected = len(result.evaluations)
+            if selected in requested_set:
+                reason = (
+                    "candidate_pool_exhausted"
+                    if not remaining
+                    else "budget_exhausted"
+                )
+                snapshots[selected] = _snapshot_result(
+                    result,
+                    budget=selected,
+                    termination_reason=reason,
+                )
+
         if not remaining and result.termination_reason == "budget_exhausted":
             result.termination_reason = "candidate_pool_exhausted"
-        return result
+        for budget in requested_budgets:
+            if budget not in snapshots:
+                snapshots[budget] = _snapshot_result(
+                    result,
+                    budget=budget,
+                    termination_reason=result.termination_reason,
+                )
+        return {budget: snapshots[budget] for budget in requested_budgets}
 
 
 def run_live_search(

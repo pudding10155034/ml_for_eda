@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import csv
+import fcntl
 import hashlib
 import json
+import os
 import platform
 import shutil
+import socket
 import statistics
 import subprocess
 import sys
@@ -17,13 +20,16 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from .abc_runner import ABCRunner, iter_circuit_files
-from .dataset import write_trajectories
+from .dataset import DATASET_FIELDS, trajectory_rows
 from .model import RiskModel, train_risk_model
 from .recipes import Recipe, generate_recipes, load_recipes, save_recipes
-from .simulation import load_oracle_trajectories, simulate_search_from_oracle
+from .simulation import OracleSimulator, load_oracle_trajectories
 
 
 RUNNER_SCHEMA_VERSION = 1
+COLLECTION_PROGRESS_SCHEMA_VERSION = 1
+SIMULATION_ARTIFACT_SCHEMA_VERSION = 2
+PROGRESS_LOG_INTERVAL = 10
 
 
 def _utc_now() -> str:
@@ -328,6 +334,179 @@ def _package_versions() -> dict[str, str]:
     return versions
 
 
+def _active_legacy_runner_pids(config_source: Path) -> list[int]:
+    """Find pre-lock runner processes using the same config on Linux/WSL."""
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return []
+    active: list[int] = []
+    for process_dir in proc_root.iterdir():
+        if not process_dir.name.isdigit():
+            continue
+        pid = int(process_dir.name)
+        if pid == os.getpid():
+            continue
+        try:
+            arguments = [
+                item.decode(errors="replace")
+                for item in (process_dir / "cmdline").read_bytes().split(b"\0")
+                if item
+            ]
+            if (
+                "experiment" not in arguments
+                or "--config" not in arguments
+                or not any("riskaware-eda" in item for item in arguments)
+            ):
+                continue
+            raw_config = Path(arguments[arguments.index("--config") + 1])
+            if not raw_config.is_absolute():
+                raw_config = Path(os.readlink(process_dir / "cwd")) / raw_config
+            if raw_config.resolve() == config_source.resolve():
+                active.append(pid)
+        except (IndexError, OSError, UnicodeError):
+            continue
+    return sorted(active)
+
+
+@dataclass(frozen=True)
+class _RecoveredCSV:
+    rows: tuple[dict[str, str], ...]
+    recipe_ids: tuple[str, ...]
+
+
+def _valid_recipe_rows(
+    rows: Sequence[Mapping[str, str]],
+    recipe: Recipe,
+    circuit_id: str,
+) -> bool:
+    expected_steps = list(range(len(recipe.operations) + 1))
+    try:
+        steps = [int(row["step"]) for row in rows]
+    except (KeyError, TypeError, ValueError):
+        return False
+    return bool(
+        len(rows) == len(expected_steps)
+        and steps == expected_steps
+        and all(
+            set(row) == set(DATASET_FIELDS)
+            and all(value is not None for value in row.values())
+            for row in rows
+        )
+        and all(row.get("circuit_id") == circuit_id for row in rows)
+        and all(row.get("recipe_id") == recipe.recipe_id for row in rows)
+        and all(
+            row.get("recipe") == "|".join(recipe.operations) for row in rows
+        )
+        and all(
+            row.get("recipe_length") == str(len(recipe.operations)) for row in rows
+        )
+        and all(row.get("completed") == "1" for row in rows)
+        and all(not row.get("error") for row in rows)
+        and rows[0].get("action") == "__start__"
+        and [row.get("action") for row in rows[1:]] == list(recipe.operations)
+        and all(row.get("final_qor") not in {None, ""} for row in rows)
+    )
+
+
+def _recover_csv_prefix(
+    source: Path,
+    recipes: Sequence[Recipe],
+    circuit_id: str,
+) -> _RecoveredCSV:
+    """Return the longest valid, ordered trajectory prefix in a partial shard."""
+    if not source.is_file() or not recipes:
+        return _RecoveredCSV((), ())
+    recovered_rows: list[dict[str, str]] = []
+    recovered_ids: list[str] = []
+    recipe_index = 0
+    current_rows: list[dict[str, str]] = []
+
+    def accept_current() -> bool:
+        nonlocal recipe_index, current_rows
+        if not current_rows or recipe_index >= len(recipes):
+            return False
+        recipe = recipes[recipe_index]
+        if not _valid_recipe_rows(current_rows, recipe, circuit_id):
+            return False
+        recovered_rows.extend(current_rows)
+        recovered_ids.append(recipe.recipe_id)
+        recipe_index += 1
+        current_rows = []
+        return True
+
+    try:
+        with source.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if tuple(reader.fieldnames or ()) != DATASET_FIELDS:
+                return _RecoveredCSV((), ())
+            for row in reader:
+                if recipe_index >= len(recipes):
+                    break
+                expected_id = recipes[recipe_index].recipe_id
+                recipe_id = row.get("recipe_id")
+                if not current_rows:
+                    if recipe_id != expected_id:
+                        break
+                    current_rows.append(row)
+                elif recipe_id == expected_id:
+                    current_rows.append(row)
+                else:
+                    if not accept_current():
+                        break
+                    if recipe_index >= len(recipes):
+                        break
+                    if recipe_id != recipes[recipe_index].recipe_id:
+                        break
+                    current_rows.append(row)
+            if current_rows:
+                accept_current()
+    except (OSError, UnicodeDecodeError, csv.Error):
+        if current_rows:
+            accept_current()
+    return _RecoveredCSV(tuple(recovered_rows), tuple(recovered_ids))
+
+
+class _ExperimentLock:
+    """Process-scoped advisory lock for one experiment output directory."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._handle: Any | None = None
+
+    def __enter__(self) -> "_ExperimentLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            handle.seek(0)
+            owner = handle.read().strip() or "owner details unavailable"
+            handle.close()
+            raise RuntimeError(
+                f"another experiment runner is active for {self.path.parent}: {owner}"
+            ) from exc
+        owner = {
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "acquired_at": _utc_now(),
+        }
+        handle.seek(0)
+        handle.truncate()
+        json.dump(owner, handle, ensure_ascii=False)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+        self._handle = handle
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> bool:
+        if self._handle is not None:
+            fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+            self._handle.close()
+            self._handle = None
+        return False
+
+
 class ExperimentRunner:
     def __init__(
         self,
@@ -342,6 +521,7 @@ class ExperimentRunner:
         self.runner_factory = runner_factory
         self.progress = progress or (lambda _: None)
         self.manifest_path = config.output_dir / "manifest.json"
+        self.lock_path = config.output_dir / "run.lock"
 
     def plan(self) -> dict[str, Any]:
         recipe_seed_count = len(self.config.recipes.seeds)
@@ -377,6 +557,7 @@ class ExperimentRunner:
             "runner_schema_version": RUNNER_SCHEMA_VERSION,
             "fingerprint": self.config.fingerprint,
             "status": status,
+            "runner_pid": os.getpid(),
             "updated_at": _utc_now(),
             "config_source": str(self.config.source),
             "config": self.config.to_dict(),
@@ -412,7 +593,9 @@ class ExperimentRunner:
                 )
             if not self.resume:
                 raise ValueError("output already exists; pass --resume to continue it")
-        elif output.exists() and any(output.iterdir()):
+        elif output.exists() and any(
+            item != self.lock_path for item in output.iterdir()
+        ):
             raise ValueError("non-empty output directory has no compatible manifest")
         else:
             output.mkdir(parents=True, exist_ok=True)
@@ -423,6 +606,17 @@ class ExperimentRunner:
         else:
             manifest["created_at"] = _utc_now()
         _atomic_json(manifest, self.manifest_path)
+
+    def _legacy_runner_pids(self) -> list[int]:
+        if not self.manifest_path.is_file():
+            return []
+        try:
+            manifest = _read_json(self.manifest_path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return []
+        if manifest.get("status") != "running" or manifest.get("runner_pid"):
+            return []
+        return _active_legacy_runner_pids(self.config.source)
 
     def _finish_manifest(self, status: str, error: str | None = None) -> None:
         manifest = _read_json(self.manifest_path)
@@ -462,6 +656,129 @@ class ExperimentRunner:
         return self._collection_checkpoint(seed, circuit).with_name(
             f"{circuit.stem}.failed.json"
         )
+
+    def _collection_progress(self, seed: int, circuit: Path) -> Path:
+        return self._collection_checkpoint(seed, circuit).with_name(
+            f"{circuit.stem}.progress.json"
+        )
+
+    def _partial_shard_path(self, seed: int, circuit: Path) -> Path:
+        return self._shard_path(seed, circuit).with_suffix(".csv.partial")
+
+    def _legacy_partial_shard_path(self, seed: int, circuit: Path) -> Path:
+        return self._shard_path(seed, circuit).with_suffix(".csv.tmp")
+
+    def _collection_dependencies(self, seed: int, circuit: Path) -> dict[str, Any]:
+        return {
+            "fingerprint": self.config.fingerprint,
+            "recipe_seed": seed,
+            "circuit_id": circuit.stem,
+            "circuit_path": str(circuit),
+            "circuit_signature": _file_signature(circuit),
+            "recipe_signature": _file_signature(self._recipe_path(seed)),
+            "abc_signature": _file_signature(self.config.abc),
+        }
+
+    @staticmethod
+    def _progress_matches_dependencies(
+        payload: Mapping[str, Any], dependencies: Mapping[str, Any]
+    ) -> bool:
+        return all(payload.get(key) == value for key, value in dependencies.items())
+
+    def _write_collection_progress(
+        self,
+        seed: int,
+        circuit: Path,
+        partial: Path,
+        *,
+        completed: int,
+        rows: int,
+        total: int,
+        dependencies: Mapping[str, Any],
+        recovery_source: str | None,
+    ) -> None:
+        _atomic_json(
+            {
+                "progress_schema_version": COLLECTION_PROGRESS_SCHEMA_VERSION,
+                **dependencies,
+                "partial": str(partial),
+                "partial_signature": _file_signature(partial),
+                "completed_recipes": completed,
+                "total_recipes": total,
+                "rows": rows,
+                "last_recipe_id": (
+                    None if completed == 0 else f"r{completed - 1:05d}"
+                ),
+                "recovery_source": recovery_source,
+                "runner_pid": os.getpid(),
+                "heartbeat_at": _utc_now(),
+            },
+            self._collection_progress(seed, circuit),
+        )
+
+    def _prepare_partial_shard(
+        self,
+        seed: int,
+        circuit: Path,
+        recipes: Sequence[Recipe],
+        dependencies: Mapping[str, Any],
+    ) -> tuple[Path, _RecoveredCSV, str | None]:
+        partial = self._partial_shard_path(seed, circuit)
+        legacy = self._legacy_partial_shard_path(seed, circuit)
+        shard = self._shard_path(seed, circuit)
+        checkpoint = self._collection_checkpoint(seed, circuit)
+        progress_path = self._collection_progress(seed, circuit)
+        candidates: list[Path] = []
+        progress_exists = progress_path.is_file()
+        progress_compatible = False
+        if progress_exists:
+            try:
+                progress_compatible = self._progress_matches_dependencies(
+                    _read_json(progress_path), dependencies
+                )
+            except (OSError, ValueError, json.JSONDecodeError):
+                progress_compatible = False
+
+        if self.resume and (progress_compatible or not progress_exists):
+            candidates.extend(path for path in (partial, legacy) if path.is_file())
+            if shard.is_file() and (not checkpoint.is_file() or progress_compatible):
+                candidates.append(shard)
+        elif self.resume and progress_exists and not progress_compatible:
+            self.progress(
+                f"collection invalidated stale partial: seed={seed} "
+                f"circuit={circuit.stem}"
+            )
+
+        recovered = _RecoveredCSV((), ())
+        recovery_source: str | None = None
+        for candidate in candidates:
+            candidate_recovery = _recover_csv_prefix(
+                candidate, recipes, circuit.stem
+            )
+            if len(candidate_recovery.recipe_ids) > len(recovered.recipe_ids):
+                recovered = candidate_recovery
+                recovery_source = str(candidate)
+
+        partial.parent.mkdir(parents=True, exist_ok=True)
+        temporary = partial.with_suffix(partial.suffix + ".recovering")
+        with temporary.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=DATASET_FIELDS)
+            writer.writeheader()
+            writer.writerows(recovered.rows)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(partial)
+        self._write_collection_progress(
+            seed,
+            circuit,
+            partial,
+            completed=len(recovered.recipe_ids),
+            rows=len(recovered.rows),
+            total=len(recipes),
+            dependencies=dependencies,
+            recovery_source=recovery_source,
+        )
+        return partial, recovered, recovery_source
 
     def _dataset_path(self, seed: int) -> Path:
         return self.config.output_dir / "datasets" / f"{self._seed_tag(seed)}.csv"
@@ -580,46 +897,98 @@ class ExperimentRunner:
         shard = self._shard_path(seed, circuit)
         checkpoint = self._collection_checkpoint(seed, circuit)
         failure = self._collection_failure(seed, circuit)
-        shard.parent.mkdir(parents=True, exist_ok=True)
-        shard.with_suffix(shard.suffix + ".tmp").unlink(missing_ok=True)
+        progress_path = self._collection_progress(seed, circuit)
+        legacy_partial = self._legacy_partial_shard_path(seed, circuit)
         started = time.perf_counter()
+        completed_count = 0
+        row_count = 0
         try:
-            runner = self.runner_factory(
-                self.config.abc,
-                timeout_s=self.config.collection.timeout_s,
-                keep_workdir=False,
+            dependencies = self._collection_dependencies(seed, circuit)
+            partial, recovered, recovery_source = self._prepare_partial_shard(
+                seed, circuit, recipes, dependencies
             )
-            with runner.session(circuit) as session:
+            completed_count = len(recovered.recipe_ids)
+            row_count = len(recovered.rows)
+            if completed_count:
+                self.progress(
+                    f"collection resume: seed={seed} circuit={circuit.stem} "
+                    f"{completed_count}/{len(recipes)} recipes"
+                )
 
-                def trajectories() -> Any:
-                    for recipe in recipes:
-                        yield session.run_recipe(recipe)
+            remaining = recipes[completed_count:]
+            if remaining:
+                runner = self.runner_factory(
+                    self.config.abc,
+                    timeout_s=self.config.collection.timeout_s,
+                    keep_workdir=False,
+                )
+                with runner.session(circuit) as session, partial.open(
+                    "a", encoding="utf-8", newline=""
+                ) as handle:
+                    writer = csv.DictWriter(handle, fieldnames=DATASET_FIELDS)
+                    for recipe in remaining:
+                        trajectory = session.run_recipe(recipe)
+                        if (
+                            not trajectory.completed
+                            or trajectory.error is not None
+                            or trajectory.circuit_id != circuit.stem
+                            or trajectory.recipe_id != recipe.recipe_id
+                            or trajectory.operations != recipe.operations
+                            or len(trajectory.steps) != len(recipe.operations)
+                        ):
+                            detail = trajectory.error or "incomplete trajectory"
+                            raise RuntimeError(
+                                f"recipe {recipe.recipe_id} failed: {detail}"
+                            )
+                        rows = list(trajectory_rows(trajectory))
+                        writer.writerows(rows)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                        completed_count += 1
+                        row_count += len(rows)
+                        self._write_collection_progress(
+                            seed,
+                            circuit,
+                            partial,
+                            completed=completed_count,
+                            rows=row_count,
+                            total=len(recipes),
+                            dependencies=dependencies,
+                            recovery_source=recovery_source,
+                        )
+                        if (
+                            completed_count % PROGRESS_LOG_INTERVAL == 0
+                            or completed_count == len(recipes)
+                        ):
+                            self.progress(
+                                f"collection progress: seed={seed} "
+                                f"circuit={circuit.stem} "
+                                f"{completed_count}/{len(recipes)} recipes"
+                            )
 
-                report = write_trajectories(trajectories(), shard)
+            partial.replace(shard)
+            report = {
+                "trajectories": len(recipes),
+                "completed": len(recipes),
+                "failed": 0,
+                "rows": row_count,
+            }
             elapsed = time.perf_counter() - started
             metadata: dict[str, Any] = {
                 "runner_schema_version": RUNNER_SCHEMA_VERSION,
-                "fingerprint": self.config.fingerprint,
-                "recipe_seed": seed,
-                "circuit_id": circuit.stem,
-                "circuit_path": str(circuit),
-                "circuit_signature": _file_signature(circuit),
-                "recipe_signature": _file_signature(self._recipe_path(seed)),
-                "abc_signature": _file_signature(self.config.abc),
+                **dependencies,
                 "shard": str(shard),
                 "shard_signature": _file_signature(shard),
+                "resumed_trajectories": len(recovered.recipe_ids),
+                "new_trajectories": len(recipes) - len(recovered.recipe_ids),
+                "recovery_source": recovery_source,
                 "elapsed_wall_s": elapsed,
                 "finished_at": _utc_now(),
                 "report": report,
             }
-            if (
-                report["failed"]
-                or report["completed"] != self.config.recipes.count
-            ):
-                metadata["error"] = "one or more ABC trajectories failed"
-                _atomic_json(metadata, failure)
-                return {"ok": False, **metadata}
             _atomic_json(metadata, checkpoint)
+            progress_path.unlink(missing_ok=True)
+            legacy_partial.unlink(missing_ok=True)
             failure.unlink(missing_ok=True)
             return {"ok": True, **metadata}
         except Exception as exc:
@@ -629,6 +998,8 @@ class ExperimentRunner:
                 "recipe_seed": seed,
                 "circuit_id": circuit.stem,
                 "circuit_path": str(circuit),
+                "completed_recipes": completed_count,
+                "total_recipes": len(recipes),
                 "elapsed_wall_s": time.perf_counter() - started,
                 "finished_at": _utc_now(),
                 "error": f"{type(exc).__name__}: {exc}",
@@ -752,6 +1123,12 @@ class ExperimentRunner:
             "pending": len(pending),
             "completed": len(results),
             "skipped": skipped,
+            "resumed_recipes": sum(
+                int(result.get("resumed_trajectories", 0)) for result in results
+            ),
+            "new_recipes": sum(
+                int(result.get("new_trajectories", 0)) for result in results
+            ),
             "datasets": datasets,
         }
 
@@ -849,20 +1226,33 @@ class ExperimentRunner:
         path = self._simulation_path(seed, circuit, budget, search_seed)
         model_path = self._model_path(seed, circuit)
         dataset_path = self._dataset_path(seed)
+        oracle_path = self._shard_path(seed, circuit)
         if not path.is_file() or not model_path.is_file() or not dataset_path.is_file():
             return False
         try:
             payload = _read_json(path)
-        except (OSError, ValueError, json.JSONDecodeError):
+            artifact_schema = int(
+                payload.get("simulation_artifact_schema_version", 1)
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
             return False
         return bool(
-            payload.get("fingerprint") == self.config.fingerprint
+            artifact_schema in {1, SIMULATION_ARTIFACT_SCHEMA_VERSION}
+            and payload.get("fingerprint") == self.config.fingerprint
             and payload.get("recipe_seed") == seed
             and payload.get("holdout_circuit") == circuit.stem
             and payload.get("budget") == budget
             and payload.get("search_seed") == search_seed
             and payload.get("dataset_signature") == _file_signature(dataset_path)
             and payload.get("model_signature") == _file_signature(model_path)
+            and (
+                artifact_schema == 1
+                or (
+                    payload.get("oracle") == str(oracle_path)
+                    and payload.get("oracle_signature")
+                    == _file_signature(oracle_path)
+                )
+            )
         )
 
     def evaluate(self) -> dict[str, Any]:
@@ -875,21 +1265,26 @@ class ExperimentRunner:
                     "run the collect phase first"
                 )
             for circuit in self.config.circuits:
-                pending = [
-                    (budget, search_seed)
-                    for budget in self.config.evaluation.budgets
-                    for search_seed in self.config.evaluation.search_seeds
-                    if not (
-                        self.resume
-                        and self._simulation_complete(
-                            seed, circuit, budget, search_seed
+                pending_by_search_seed = {
+                    search_seed: tuple(
+                        budget
+                        for budget in self.config.evaluation.budgets
+                        if not (
+                            self.resume
+                            and self._simulation_complete(
+                                seed, circuit, budget, search_seed
+                            )
                         )
                     )
-                ]
+                    for search_seed in self.config.evaluation.search_seeds
+                }
+                pending = sum(
+                    len(budgets) for budgets in pending_by_search_seed.values()
+                )
                 skipped += (
                     len(self.config.evaluation.budgets)
                     * len(self.config.evaluation.search_seeds)
-                    - len(pending)
+                    - pending
                 )
                 if not pending:
                     continue
@@ -901,42 +1296,55 @@ class ExperimentRunner:
                         f"holdout={circuit.stem}; run the train phase first"
                     )
                 model = RiskModel.load(model_path)
-                oracle = load_oracle_trajectories(dataset, circuit.stem)
+                oracle_path = self._shard_path(seed, circuit)
+                oracle = load_oracle_trajectories(oracle_path, circuit.stem)
+                simulator = OracleSimulator(oracle, model)
                 training_payload = _read_json(report_path)["training_report"]
-                for budget, search_seed in pending:
+                dataset_signature = _file_signature(dataset)
+                model_signature = _file_signature(model_path)
+                oracle_signature = _file_signature(oracle_path)
+                for search_seed, pending_budgets in pending_by_search_seed.items():
+                    if not pending_budgets:
+                        continue
                     self.progress(
                         f"simulation: seed={seed} holdout={circuit.stem} "
-                        f"budget={budget} search_seed={search_seed}"
+                        f"budgets={','.join(str(item) for item in pending_budgets)} "
+                        f"search_seed={search_seed}"
                     )
-                    result = simulate_search_from_oracle(
-                        oracle,
-                        model,
-                        budget=budget,
+                    results = simulator.simulate_budgets(
+                        pending_budgets,
                         seed=search_seed,
                         min_steps_before_stopping=(
                             self.config.evaluation.min_stop_step
                         ),
                     )
-                    destination = self._simulation_path(
-                        seed, circuit, budget, search_seed
-                    )
-                    _atomic_json(
-                        {
-                            "runner_schema_version": RUNNER_SCHEMA_VERSION,
-                            "fingerprint": self.config.fingerprint,
-                            "recipe_seed": seed,
-                            "holdout_circuit": circuit.stem,
-                            "budget": budget,
-                            "search_seed": search_seed,
-                            "dataset_signature": _file_signature(dataset),
-                            "model_signature": _file_signature(model_path),
-                            "training_report": training_payload,
-                            "result": result.to_dict(),
-                            "finished_at": _utc_now(),
-                        },
-                        destination,
-                    )
-                    completed += 1
+                    for budget in pending_budgets:
+                        destination = self._simulation_path(
+                            seed, circuit, budget, search_seed
+                        )
+                        _atomic_json(
+                            {
+                                "runner_schema_version": RUNNER_SCHEMA_VERSION,
+                                "simulation_artifact_schema_version": (
+                                    SIMULATION_ARTIFACT_SCHEMA_VERSION
+                                ),
+                                "fingerprint": self.config.fingerprint,
+                                "recipe_seed": seed,
+                                "holdout_circuit": circuit.stem,
+                                "budget": budget,
+                                "search_seed": search_seed,
+                                "dataset_signature": dataset_signature,
+                                "model_signature": model_signature,
+                                "oracle": str(oracle_path),
+                                "oracle_signature": oracle_signature,
+                                "training_report": training_payload,
+                                "result": results[budget].to_dict(),
+                                "finished_at": _utc_now(),
+                            },
+                            destination,
+                        )
+                        completed += 1
+                del simulator, model, oracle
         aggregate = self._aggregate_results()
         return {"completed": completed, "skipped": skipped, **aggregate}
 
@@ -1042,6 +1450,18 @@ class ExperimentRunner:
         if dry_run:
             return {"dry_run": True, "phase": phase, "plan": self.plan()}
 
+        legacy_pids = self._legacy_runner_pids()
+        if legacy_pids:
+            raise RuntimeError(
+                "a legacy experiment runner is still active for this config "
+                f"(PID(s): {', '.join(str(pid) for pid in legacy_pids)}); "
+                "wait for it to finish or stop it before resuming"
+            )
+
+        with _ExperimentLock(self.lock_path):
+            return self._run_locked(phase)
+
+    def _run_locked(self, phase: str) -> dict[str, Any]:
         self._prepare_output()
         run_started = time.perf_counter()
         payload: dict[str, Any] = {
@@ -1074,6 +1494,6 @@ class ExperimentRunner:
             _atomic_json(payload, self.config.output_dir / "last_run.json")
             self._finish_manifest("complete")
             return payload
-        except Exception as exc:
+        except BaseException as exc:
             self._finish_manifest("failed", f"{type(exc).__name__}: {exc}")
             raise

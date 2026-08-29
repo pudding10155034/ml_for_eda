@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Sequence
 
 from .dataset import read_dataset
-from .model import RiskModel
+from .model import Prediction, RiskModel
 from .qor import normalized_qor
 from .recipes import Recipe
 from .search import RiskAwareSearcher, SearchResult
@@ -119,6 +119,167 @@ class SimulationResult:
         }
 
 
+class OracleSimulator:
+    """Prepared, reusable offline simulator for one model and one holdout.
+
+    Start-state predictions are computed once. Prefix predictions are cached by
+    ``(recipe_id, completed_steps)`` and reused across search seeds and budgets.
+    The cache is intentionally scoped to this one oracle/model pair.
+    """
+
+    def __init__(
+        self,
+        oracle: Sequence[Trajectory],
+        model: RiskModel,
+    ) -> None:
+        if not oracle:
+            raise ValueError("oracle must contain at least one trajectory")
+        circuit_ids = {trajectory.circuit_id for trajectory in oracle}
+        if len(circuit_ids) != 1:
+            raise ValueError(
+                "oracle trajectories must belong to exactly one circuit"
+            )
+        recipe_ids = [trajectory.recipe_id for trajectory in oracle]
+        if len(recipe_ids) != len(set(recipe_ids)):
+            raise ValueError("oracle recipe IDs must be unique")
+
+        self.oracle = tuple(oracle)
+        self.model = model
+        self.circuit_id = next(iter(circuit_ids))
+        self.initial = self.oracle[0].initial
+        self.by_recipe = {
+            trajectory.recipe_id: trajectory for trajectory in self.oracle
+        }
+        self.recipes = tuple(
+            Recipe(trajectory.recipe_id, trajectory.operations)
+            for trajectory in self.oracle
+        )
+        start_states = [
+            Trajectory(
+                circuit_id=self.circuit_id,
+                recipe_id=recipe.recipe_id,
+                operations=recipe.operations,
+                initial=self.initial,
+            )
+            for recipe in self.recipes
+        ]
+        self.start_predictions = dict(
+            zip(
+                recipe_ids,
+                self.model.predict_trajectories(start_states),
+                strict=True,
+            )
+        )
+        self.oracle_scores = {
+            trajectory.recipe_id: normalized_qor(
+                trajectory.current_stats, trajectory.initial
+            )
+            for trajectory in self.oracle
+        }
+        self.oracle_best_recipe_id = min(
+            self.oracle_scores, key=self.oracle_scores.get
+        )
+        self.oracle_best_qor = self.oracle_scores[self.oracle_best_recipe_id]
+        self._prefix_predictions: dict[tuple[str, int], Prediction] = {}
+        self._prefix_cache_hits = 0
+        self._prefix_cache_misses = 0
+
+    def _predict_trajectory(self, trajectory: Trajectory) -> Prediction:
+        key = (trajectory.recipe_id, len(trajectory.steps))
+        prediction = self._prefix_predictions.get(key)
+        if prediction is None:
+            prediction = self.model.predict_trajectory(trajectory)
+            self._prefix_predictions[key] = prediction
+            self._prefix_cache_misses += 1
+        else:
+            self._prefix_cache_hits += 1
+        return prediction
+
+    def cache_info(self) -> dict[str, int]:
+        return {
+            "start_predictions": len(self.start_predictions),
+            "prefix_entries": len(self._prefix_predictions),
+            "prefix_hits": self._prefix_cache_hits,
+            "prefix_misses": self._prefix_cache_misses,
+        }
+
+    def simulate_budgets(
+        self,
+        budgets: Sequence[int],
+        *,
+        seed: int = 0,
+        min_steps_before_stopping: int = 2,
+    ) -> dict[int, SimulationResult]:
+        budget_values = tuple(dict.fromkeys(int(item) for item in budgets))
+        if not budget_values:
+            raise ValueError("at least one budget is required")
+        if min(budget_values) < 1:
+            raise ValueError("budgets must be positive")
+
+        def evaluator(
+            recipe: Recipe,
+            callback: StopCallback | None,
+        ) -> Trajectory:
+            return _replay(self.by_recipe[recipe.recipe_id], callback)
+
+        searcher = RiskAwareSearcher(
+            self.model,
+            budget=max(budget_values),
+            seed=seed,
+            min_steps_before_stopping=min_steps_before_stopping,
+        )
+        searches = searcher.run_budgets(
+            circuit_id=self.circuit_id,
+            initial=self.initial,
+            recipes=self.recipes,
+            evaluator=evaluator,
+            budgets=budget_values,
+            start_predictions=self.start_predictions,
+            predict_trajectory=self._predict_trajectory,
+        )
+
+        rng = random.Random(seed)
+        random_order = list(self.oracle)
+        rng.shuffle(random_order)
+        results: dict[int, SimulationResult] = {}
+        for budget in budget_values:
+            random_selected = random_order[: min(budget, len(random_order))]
+            random_best_trajectory = min(
+                random_selected,
+                key=lambda item: self.oracle_scores[item.recipe_id],
+            )
+            random_baseline = BaselineResult(
+                best_recipe_id=random_best_trajectory.recipe_id,
+                best_qor=self.oracle_scores[random_best_trajectory.recipe_id],
+                total_runtime_s=sum(
+                    item.cumulative_runtime_s for item in random_selected
+                ),
+                evaluations=len(random_selected),
+            )
+            search = searches[budget]
+            relative_gap = (
+                None
+                if search.best_qor is None
+                else 100.0
+                * (search.best_qor - self.oracle_best_qor)
+                / max(abs(self.oracle_best_qor), 1e-12)
+            )
+            runtime_reduction = 100.0 * (
+                1.0
+                - search.total_runtime_s
+                / max(random_baseline.total_runtime_s, 1e-12)
+            )
+            results[budget] = SimulationResult(
+                search=search,
+                random_baseline=random_baseline,
+                oracle_best_recipe_id=self.oracle_best_recipe_id,
+                oracle_best_qor=self.oracle_best_qor,
+                relative_gap_pct=relative_gap,
+                runtime_reduction_vs_random_pct=runtime_reduction,
+            )
+        return results
+
+
 def simulate_search(
     dataset: str | Path,
     circuit_id: str,
@@ -148,74 +309,12 @@ def simulate_search_from_oracle(
 ) -> SimulationResult:
     """Simulate search using an in-memory oracle trajectory set.
 
-    Experiment sweeps use this entry point to parse each holdout dataset once
-    and reuse it across budgets and random seeds.
+    This compatibility entry point prepares a one-shot ``OracleSimulator``.
+    Experiment sweeps construct one simulator per holdout so its predictions
+    can be reused across budgets and random seeds.
     """
-    if not oracle:
-        raise ValueError("oracle must contain at least one trajectory")
-    circuit_ids = {trajectory.circuit_id for trajectory in oracle}
-    if len(circuit_ids) != 1:
-        raise ValueError("oracle trajectories must belong to exactly one circuit")
-    circuit_id = next(iter(circuit_ids))
-    by_recipe = {trajectory.recipe_id: trajectory for trajectory in oracle}
-    recipes = [
-        Recipe(trajectory.recipe_id, trajectory.operations) for trajectory in oracle
-    ]
-    initial = oracle[0].initial
-    searcher = RiskAwareSearcher(
-        model,
-        budget=budget,
+    return OracleSimulator(oracle, model).simulate_budgets(
+        (budget,),
         seed=seed,
         min_steps_before_stopping=min_steps_before_stopping,
-    )
-
-    def evaluator(recipe: Recipe, callback: StopCallback | None) -> Trajectory:
-        return _replay(by_recipe[recipe.recipe_id], callback)
-
-    search = searcher.run(
-        circuit_id=circuit_id,
-        initial=initial,
-        recipes=recipes,
-        evaluator=evaluator,
-    )
-    oracle_scores = {
-        trajectory.recipe_id: normalized_qor(
-            trajectory.current_stats, trajectory.initial
-        )
-        for trajectory in oracle
-    }
-    oracle_best_recipe = min(oracle_scores, key=oracle_scores.get)
-    oracle_best_qor = oracle_scores[oracle_best_recipe]
-
-    rng = random.Random(seed)
-    random_order = list(oracle)
-    rng.shuffle(random_order)
-    random_selected = random_order[: min(budget, len(random_order))]
-    random_best_trajectory = min(
-        random_selected,
-        key=lambda item: normalized_qor(item.current_stats, item.initial),
-    )
-    random_baseline = BaselineResult(
-        best_recipe_id=random_best_trajectory.recipe_id,
-        best_qor=normalized_qor(
-            random_best_trajectory.current_stats, random_best_trajectory.initial
-        ),
-        total_runtime_s=sum(item.cumulative_runtime_s for item in random_selected),
-        evaluations=len(random_selected),
-    )
-    relative_gap = (
-        None
-        if search.best_qor is None
-        else 100.0 * (search.best_qor - oracle_best_qor) / max(abs(oracle_best_qor), 1e-12)
-    )
-    runtime_reduction = 100.0 * (
-        1.0 - search.total_runtime_s / max(random_baseline.total_runtime_s, 1e-12)
-    )
-    return SimulationResult(
-        search=search,
-        random_baseline=random_baseline,
-        oracle_best_recipe_id=oracle_best_recipe,
-        oracle_best_qor=oracle_best_qor,
-        relative_gap_pct=relative_gap,
-        runtime_reduction_vs_random_pct=runtime_reduction,
-    )
+    )[budget]

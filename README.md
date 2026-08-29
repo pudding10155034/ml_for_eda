@@ -21,7 +21,10 @@ logic-synthesis recipe，並以具校準區間的 surrogate model 同時決定�
   sequential early stopping。
 - Optimistic lower-bound selection、safe elimination 與 risk-aware early stopping。
 - Held-out circuit oracle replay，可在不用重新執行 ABC 的情況下快速做 ablation。
-- 具 shard checkpoint、設定 fingerprint 與原子 metadata 的可續跑實驗 runner。
+- 具 recipe 級 durable checkpoint、設定 fingerprint、single-run lock 與原子
+  metadata 的可續跑實驗 runner。
+- 評估時以 holdout-scoped cache 共用 start/prefix predictions，並在一次搜尋中
+  精確保存多個 budget snapshots；結果與獨立執行各 budget 完全等價。
 - Synthetic end-to-end demo 與單元測試。
 
 ## QoR 定義
@@ -54,7 +57,7 @@ logic-synthesis recipe，並以具校準區間的 surrogate model 同時決定�
 輸出包含 recipes、synthetic trajectory dataset、校準後模型、training report 與
 held-out circuit simulation。
 
-真實 ABC 小規模 pilot 可直接執行，若中斷後重下同一指令會從最後完成的 shard、
+真實 ABC 小規模 pilot 可直接執行，若中斷後重下同一指令會從最後完成的 recipe、
 模型或 simulation 繼續：
 
     make pilot
@@ -65,6 +68,13 @@ held-out circuit simulation。
 
 runner 的輸出結構、checkpoint 判定與分階段指令請見
 [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md)。
+
+評估效能可用不修改 artifacts 的 benchmark 檢查：
+
+    .venv/bin/python scripts/benchmark_evaluation.py \
+      --config configs/pilot_experiment.json \
+      --experiment-dir artifacts/experiments/epfl_pilot \
+      --verify-artifacts
 
 ## 安裝 Berkeley ABC 與取得小型 EPFL 子集
 
