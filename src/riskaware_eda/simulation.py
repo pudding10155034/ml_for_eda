@@ -13,6 +13,42 @@ from .search import RiskAwareSearcher, SearchResult
 from .types import NetworkStats, StopCallback, Trajectory, TrajectoryStep
 
 
+# A compact, named policy registry keeps ablations comparable while preserving
+# the production defaults used by the formal experiment runner.
+SEARCH_POLICIES: dict[str, dict[str, object]] = {
+    "risk_aware": {
+        "selection": "lcb",
+        "safe_elimination": True,
+        "early_stopping": True,
+    },
+    "random": {
+        "selection": "random",
+        "safe_elimination": False,
+        "early_stopping": False,
+    },
+    "mean_greedy": {
+        "selection": "mean",
+        "safe_elimination": False,
+        "early_stopping": False,
+    },
+    "lcb_only": {
+        "selection": "lcb",
+        "safe_elimination": False,
+        "early_stopping": False,
+    },
+    "selection_only": {
+        "selection": "lcb",
+        "safe_elimination": True,
+        "early_stopping": False,
+    },
+    "early_stop_only": {
+        "selection": "random",
+        "safe_elimination": False,
+        "early_stopping": True,
+    },
+}
+
+
 def load_oracle_trajectories(
     dataset: str | Path,
     circuit_id: str,
@@ -209,12 +245,20 @@ class OracleSimulator:
         *,
         seed: int = 0,
         min_steps_before_stopping: int = 2,
+        policy: str = "risk_aware",
     ) -> dict[int, SimulationResult]:
         budget_values = tuple(dict.fromkeys(int(item) for item in budgets))
         if not budget_values:
             raise ValueError("at least one budget is required")
         if min(budget_values) < 1:
             raise ValueError("budgets must be positive")
+        try:
+            policy_options = SEARCH_POLICIES[policy]
+        except KeyError as exc:
+            raise ValueError(
+                f"unknown search policy '{policy}'; "
+                f"choose from {sorted(SEARCH_POLICIES)}"
+            ) from exc
 
         def evaluator(
             recipe: Recipe,
@@ -227,6 +271,9 @@ class OracleSimulator:
             budget=max(budget_values),
             seed=seed,
             min_steps_before_stopping=min_steps_before_stopping,
+            selection=str(policy_options["selection"]),
+            safe_elimination=bool(policy_options["safe_elimination"]),
+            early_stopping=bool(policy_options["early_stopping"]),
         )
         searches = searcher.run_budgets(
             circuit_id=self.circuit_id,
@@ -288,6 +335,7 @@ def simulate_search(
     budget: int,
     seed: int = 0,
     min_steps_before_stopping: int = 2,
+    policy: str = "risk_aware",
 ) -> SimulationResult:
     oracle = load_oracle_trajectories(dataset, circuit_id)
     return simulate_search_from_oracle(
@@ -296,6 +344,7 @@ def simulate_search(
         budget=budget,
         seed=seed,
         min_steps_before_stopping=min_steps_before_stopping,
+        policy=policy,
     )
 
 
@@ -306,6 +355,7 @@ def simulate_search_from_oracle(
     budget: int,
     seed: int = 0,
     min_steps_before_stopping: int = 2,
+    policy: str = "risk_aware",
 ) -> SimulationResult:
     """Simulate search using an in-memory oracle trajectory set.
 
@@ -317,4 +367,5 @@ def simulate_search_from_oracle(
         (budget,),
         seed=seed,
         min_steps_before_stopping=min_steps_before_stopping,
+        policy=policy,
     )[budget]

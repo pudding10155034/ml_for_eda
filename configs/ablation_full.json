@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "base_config": "experiment.json",
+  "experiment_dir": "artifacts/experiments/epfl_full",
+  "output_dir": "artifacts/ablations/epfl_full",
+  "recipe_seeds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+  "circuits": [
+    "adder", "bar", "div", "hyp", "log2", "max", "multiplier", "sin", "sqrt", "square",
+    "arbiter", "cavlc", "ctrl", "dec", "i2c", "int2float", "mem_ctrl", "priority", "router", "voter"
+  ],
+  "budgets": [10, 20, 50],
+  "search_seeds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+  "methods": [
+    "risk_aware",
+    "random",
+    "mean_greedy",
+    "lcb_only",
+    "selection_only",
+    "early_stop_only"
+  ],
+  "min_stop_step": 2
+}

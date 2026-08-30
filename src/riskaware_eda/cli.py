@@ -12,7 +12,7 @@ from .experiment import ExperimentRunner, load_experiment_config
 from .model import RiskModel, train_risk_model
 from .recipes import DEFAULT_OPERATORS, generate_recipes, load_recipes, save_recipes
 from .search import run_live_search
-from .simulation import simulate_search
+from .simulation import SEARCH_POLICIES, simulate_search
 from .synthetic import generate_synthetic_trajectories
 
 
@@ -139,6 +139,7 @@ def _command_simulate(args: argparse.Namespace) -> dict[str, object]:
         budget=args.budget,
         seed=args.seed,
         min_steps_before_stopping=args.min_stop_step,
+        policy=args.policy,
     )
     payload = result.to_dict()
     if args.output:
@@ -155,6 +156,7 @@ def _command_search(args: argparse.Namespace) -> dict[str, object]:
         keep_workdir=args.keep_workdir,
     )
     with runner.session(args.circuit) as session:
+        policy = SEARCH_POLICIES[args.policy]
         result = run_live_search(
             model=model,
             session=session,
@@ -162,6 +164,9 @@ def _command_search(args: argparse.Namespace) -> dict[str, object]:
             budget=args.budget,
             seed=args.seed,
             min_steps_before_stopping=args.min_stop_step,
+            selection=str(policy["selection"]),
+            safe_elimination=bool(policy["safe_elimination"]),
+            early_stopping=bool(policy["early_stopping"]),
         )
     payload = result.to_dict()
     if args.output:
@@ -308,6 +313,7 @@ def build_parser() -> argparse.ArgumentParser:
     simulate.add_argument("--budget", type=int, default=20)
     simulate.add_argument("--seed", type=int, default=0)
     simulate.add_argument("--min-stop-step", type=int, default=2)
+    simulate.add_argument("--policy", choices=sorted(SEARCH_POLICIES), default="risk_aware")
     simulate.add_argument("--output")
     simulate.set_defaults(handler=_command_simulate)
 
@@ -319,6 +325,7 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--budget", type=int, default=20)
     search.add_argument("--seed", type=int, default=0)
     search.add_argument("--min-stop-step", type=int, default=2)
+    search.add_argument("--policy", choices=sorted(SEARCH_POLICIES), default="risk_aware")
     search.add_argument("--timeout", type=float, default=120.0)
     search.add_argument("--keep-workdir", action="store_true")
     search.add_argument("--output")

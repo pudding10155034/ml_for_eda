@@ -1,7 +1,7 @@
 PYTHON := .venv/bin/python
 CLI := .venv/bin/riskaware-eda
 
-.PHONY: help bootstrap env test check demo pilot experiment-plan abc epfl organize
+.PHONY: help bootstrap env test check demo pilot experiment-plan analyze-full ablation-pilot ablation-full live-pilot abc epfl organize
 
 help:
 	@printf '%s\n' \
@@ -11,6 +11,10 @@ help:
 	  'make check      Run environment checks and tests' \
 	  'make demo       Run the synthetic end-to-end pipeline' \
 	  'make pilot      Run or resume the small real-ABC pilot experiment' \
+	  'make analyze-full  Audit formal results and build SVG/Markdown report' \
+	  'make ablation-pilot Run/resume the six-policy offline ablation pilot' \
+	  'make ablation-full  Run/resume the full six-policy ablation sweep' \
+	  'make live-pilot  Run/resume the small live-ABC validation pilot' \
 	  'make experiment-plan  Validate and print the full experiment plan' \
 	  'make abc        Build/update Berkeley ABC' \
 	  'make epfl       Fetch the 20 small EPFL AIGER circuits' \
@@ -35,6 +39,21 @@ pilot:
 
 experiment-plan:
 	$(CLI) experiment --config configs/experiment.json --dry-run
+
+analyze-full:
+	$(PYTHON) scripts/analyze_results.py \
+	  --simulation-root artifacts/experiments/epfl_full/simulations \
+	  --output-dir artifacts/analysis/epfl_full \
+	  --config configs/experiment.json
+
+ablation-pilot:
+	$(PYTHON) scripts/run_ablations.py --settings configs/ablation_pilot.json --resume
+
+ablation-full:
+	$(PYTHON) scripts/run_ablations.py --settings configs/ablation_full.json --resume
+
+live-pilot:
+	$(PYTHON) scripts/validate_live.py --settings configs/live_validation_pilot.json --resume
 
 abc:
 	bash scripts/setup_abc.sh

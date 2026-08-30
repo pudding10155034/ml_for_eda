@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "base_config": "pilot_experiment.json",
+  "experiment_dir": "artifacts/experiments/epfl_pilot_optimized",
+  "output_dir": "artifacts/live_validation/epfl_pilot",
+  "recipe_seed": 7,
+  "circuits": ["adder"],
+  "budgets": [3],
+  "search_seeds": [0],
+  "min_stop_step": 2,
+  "timeout_s": 120.0,
+  "keep_workdir": false
+}

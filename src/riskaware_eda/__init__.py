@@ -3,6 +3,7 @@
 from .model import RiskModel
 from .recipes import Recipe
 from .search import SearchResult
+from .simulation import SEARCH_POLICIES
 from .types import NetworkStats, Trajectory, TrajectoryStep
 
 __all__ = [
@@ -10,6 +11,7 @@ __all__ = [
     "Recipe",
     "RiskModel",
     "SearchResult",
+    "SEARCH_POLICIES",
     "Trajectory",
     "TrajectoryStep",
 ]

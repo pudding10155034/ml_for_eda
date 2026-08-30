@@ -26,6 +26,12 @@ logic-synthesis recipe，並以具校準區間的 surrogate model 同時決定�
 - 評估時以 holdout-scoped cache 共用 start/prefix predictions，並在一次搜尋中
   精確保存多個 budget snapshots；結果與獨立執行各 budget 完全等價。
 - Synthetic end-to-end demo 與單元測試。
+- 結果稽核器：驗證 simulation 格網、重新計算 bootstrap 95% CI，並輸出含 SVG
+  圖表的技術報告與 validation report。
+- 可續跑的 baseline/ablation runner：同一批 oracle shards 可比較 random、mean-only
+  greedy、LCB-only、selection-only、early-stop-only 與完整 risk-aware policy。
+- 獨立的 live-ABC validation runner：使用已完成的 model/recipe artifacts，小規模驗證
+  真實 ABC 與 offline replay 是否一致。
 
 ## QoR 定義
 
@@ -75,6 +81,24 @@ runner 的輸出結構、checkpoint 判定與分階段指令請見
       --config configs/pilot_experiment.json \
       --experiment-dir artifacts/experiments/epfl_pilot \
       --verify-artifacts
+
+正式結果完成後，可執行結果稽核與技術報告（不會改寫正式 experiment artifacts）：
+
+    make analyze-full
+
+輸出在 `artifacts/analysis/epfl_full/`，包括 `report.md`、`validation.md`、
+`report.json`、`analysis_rows.csv` 與三張帶 bootstrap 誤差線的 SVG 圖。六種策略的
+離線 pilot ablation：
+
+    make ablation-pilot
+
+完整 sweep 只需把 `configs/ablation_pilot.json` 的 recipe seeds、circuits、budgets
+與 search seeds 換成正式矩陣，並指定新的 `output_dir`；每個 cell 都有簽章與原子
+checkpoint，可中斷後以 `--resume` 繼續。小規模 live ABC 驗證：
+
+    make live-pilot
+
+live 結果獨立寫入 `artifacts/live_validation/`，不會覆蓋 offline simulation。
 
 ## 安裝 Berkeley ABC 與取得小型 EPFL 子集
 
@@ -138,7 +162,7 @@ family shift 分層報告。
 
 - Split：Leave-One-Circuit-Out，不使用 row-level random split。
 - Budget：10、20、50 recipes。
-- Baselines：random、full-evaluation random、mean-only greedy、Thompson/LCB、
+- Baselines：random、full-evaluation random、mean-only greedy、LCB、
   risk-aware selection only、early stopping only、兩者結合。
 - 主要結果：best QoR vs. total CPU seconds。
 - 次要結果：gap-to-oracle、top-1% hit rate、early-stop rate、錯殺最佳 recipe
@@ -161,6 +185,10 @@ family shift 分層報告。
       experiment.py    可續跑的 sharded experiment runner
       synthetic.py     可重現的開發用 oracle
       cli.py           命令列入口
+    scripts/
+      analyze_results.py  格網稽核、bootstrap 統計、SVG 與 Markdown 報告
+      run_ablations.py    可續跑 baseline/ablation sweep
+      validate_live.py    真實 ABC live validation
 
 ## 目前邊界
 

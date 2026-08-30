@@ -97,7 +97,13 @@ def _snapshot_result(
 
 
 class RiskAwareSearcher:
-    """Optimistic selection plus conformal safe-elimination and early stopping."""
+    """Configurable budgeted search with optional risk controls.
+
+    The default policy is the production risk-aware method: lower-confidence
+    bound selection, conformal safe elimination, and conformal early stopping.
+    The explicit switches are intentionally small so baseline and ablation
+    runs share exactly the same evaluator and accounting code.
+    """
 
     def __init__(
         self,
@@ -107,16 +113,26 @@ class RiskAwareSearcher:
         seed: int = 0,
         min_steps_before_stopping: int = 2,
         weights: QoRWeights = QoRWeights(),
+        selection: str = "lcb",
+        safe_elimination: bool = True,
+        early_stopping: bool = True,
     ) -> None:
         if budget < 1:
             raise ValueError("budget must be positive")
         if min_steps_before_stopping < 1:
             raise ValueError("min_steps_before_stopping must be positive")
+        if selection not in {"lcb", "mean", "random"}:
+            raise ValueError(
+                "selection must be one of 'lcb', 'mean', or 'random'"
+            )
         self.model = model
         self.budget = budget
         self.seed = seed
         self.min_steps_before_stopping = min_steps_before_stopping
         self.weights = weights
+        self.selection = selection
+        self.safe_elimination = bool(safe_elimination)
+        self.early_stopping = bool(early_stopping)
 
     def run(
         self,
@@ -209,7 +225,7 @@ class RiskAwareSearcher:
         requested_set = set(requested_budgets)
 
         while remaining and len(result.evaluations) < requested_budgets[-1]:
-            if result.best_qor is not None:
+            if self.safe_elimination and result.best_qor is not None:
                 eliminated = [
                     recipe_id
                     for recipe_id in remaining
@@ -222,8 +238,13 @@ class RiskAwareSearcher:
                     result.termination_reason = "all_candidates_safely_eliminated"
                     break
 
-            if result.best_qor is None:
+            if self.selection == "random" or result.best_qor is None:
                 recipe_id = rng.choice(sorted(remaining))
+            elif self.selection == "mean":
+                recipe_id = min(
+                    remaining,
+                    key=lambda item: (predictions[item].mean, item),
+                )
             else:
                 recipe_id = min(
                     remaining,
@@ -236,6 +257,8 @@ class RiskAwareSearcher:
             recipe = remaining.pop(recipe_id)
 
             def stop_callback(partial: Trajectory) -> str | None:
+                if not self.early_stopping:
+                    return None
                 if result.best_qor is None:
                     return None
                 if len(partial.steps) < self.min_steps_before_stopping:
@@ -307,6 +330,9 @@ def run_live_search(
     budget: int,
     seed: int = 0,
     min_steps_before_stopping: int = 2,
+    selection: str = "lcb",
+    safe_elimination: bool = True,
+    early_stopping: bool = True,
 ) -> SearchResult:
     """Run search against an ``ABCSession`` without coupling core logic to ABC."""
 
@@ -321,6 +347,9 @@ def run_live_search(
         budget=budget,
         seed=seed,
         min_steps_before_stopping=min_steps_before_stopping,
+        selection=selection,
+        safe_elimination=safe_elimination,
+        early_stopping=early_stopping,
     )
     return searcher.run(
         circuit_id=circuit_id,

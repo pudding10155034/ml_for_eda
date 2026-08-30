@@ -109,3 +109,68 @@ multi-budget snapshots 三種路徑；`--verify-artifacts` 會要求所有巢狀
 
 若要調整 ABC 平行度，可在不改設定檔的情況下傳入 `--jobs N`；但同一輸出目錄
 會以設定 fingerprint 保護，若要比較不同執行設定，請搭配新的 `--output` 目錄。
+
+## 結果稽核與報告
+
+正式 evaluate 完成後，先以唯讀分析器檢查完整格網並產生技術報告：
+
+    .venv/bin/python scripts/analyze_results.py \
+      --simulation-root artifacts/experiments/epfl_full/simulations \
+      --output-dir artifacts/analysis/epfl_full \
+      --config configs/experiment.json \
+      --bootstrap-reps 1000
+
+分析器會重新讀取每個 JSON，檢查 method × recipe seed × holdout circuit × budget ×
+search seed 的唯一性與完整性，並計算平均值、中位數、P05/P95、標準差與
+deterministic percentile bootstrap 95% CI。`validation.md` 會把結構檢查、計算 spot
+check、圖表 QA 與必須揭露的 caveat 分開記錄。圖表使用離散 budget 的 grouped bars；
+不將少量 budget anchor 誤畫成時間序列。
+
+## Baseline 與 ablation
+
+`configs/ablation_pilot.json` 是可直接執行的六策略 pilot：
+
+    .venv/bin/python scripts/run_ablations.py \
+      --settings configs/ablation_pilot.json \
+      --resume
+
+正式 20-circuit × 10 recipe-seed × 3 budget × 10 search-seed 的設定已另存為
+`configs/ablation_full.json`。它會產生 36,000 個 policy cells；建議先跑 pilot、確認
+live validation 與磁碟/時間預算後再啟動，且一定使用獨立的 `output_dir`：
+
+    .venv/bin/python scripts/run_ablations.py \
+      --settings configs/ablation_full.json \
+      --resume
+
+策略定義如下：
+
+- `risk_aware`：LCB selection + safe elimination + early stopping。
+- `random`：隨機 selection，停用兩個 risk control。
+- `mean_greedy`：依預測 mean selection，停用兩個 risk control。
+- `lcb_only`：LCB selection，停用 elimination 與 early stopping。
+- `selection_only`：LCB selection + safe elimination，停用 early stopping。
+- `early_stop_only`：隨機 selection + early stopping，停用 safe elimination。
+
+每個 cell 的 artifact 都記錄 settings fingerprint、model/oracle signature 與 method；
+若只缺某些 budgets，`--resume` 只補缺少的 JSON。ablation 完成後可用同一分析器：
+
+    .venv/bin/python scripts/analyze_results.py \
+      --simulation-root artifacts/ablations/epfl_pilot \
+      --output-dir artifacts/analysis/epfl_pilot_ablation \
+      --config configs/pilot_experiment.json \
+      --methods risk_aware,random,mean_greedy,lcb_only,selection_only,early_stop_only \
+      --recipe-seeds 7 --circuits adder,bar,cavlc,ctrl,router \
+      --budgets 5,10 --search-seeds 0,1
+
+## Live ABC validation
+
+`configs/live_validation_pilot.json` 會把一個 adder/budget=3/search seed=0 實際送進
+ABC，並把 live best QoR 與相同 recipe shard 的 exhaustive oracle 對照：
+
+    .venv/bin/python scripts/validate_live.py \
+      --settings configs/live_validation_pilot.json \
+      --resume
+
+live output 與 offline output 分開保存，且每個 cell 都驗證 circuit、recipe、model
+signature。若 live 與 replay 差異很大，先檢查 ABC binary、檔案 provenance 與量測雜訊，
+再決定是否需要重新收集資料或訓練模型。
