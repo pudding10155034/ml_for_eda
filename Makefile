@@ -1,7 +1,7 @@
 PYTHON := .venv/bin/python
 CLI := .venv/bin/riskaware-eda
 
-.PHONY: help bootstrap env test check demo pilot experiment-plan analyze-full ablation-pilot ablation-full live-pilot abc epfl organize
+.PHONY: help bootstrap env test check demo pilot experiment-plan analyze-full analyze-live-ablation analyze-live-repeat ablation-pilot ablation-full live-pilot live-ablation-pilot live-repeat-pilot abc epfl organize
 
 help:
 	@printf '%s\n' \
@@ -12,9 +12,13 @@ help:
 	  'make demo       Run the synthetic end-to-end pipeline' \
 	  'make pilot      Run or resume the small real-ABC pilot experiment' \
 	  'make analyze-full  Audit formal results and build SVG/Markdown report' \
+	  'make analyze-live-ablation  Summarize live policy comparison' \
+	  'make analyze-live-repeat  Summarize repeated live timing noise' \
 	  'make ablation-pilot Run/resume the six-policy offline ablation pilot' \
 	  'make ablation-full  Run/resume the full six-policy ablation sweep' \
 	  'make live-pilot  Run/resume the small live-ABC validation pilot' \
+	  'make live-ablation-pilot  Compare all six policies on live ABC' \
+	  'make live-repeat-pilot  Repeat one live policy to measure timing noise' \
 	  'make experiment-plan  Validate and print the full experiment plan' \
 	  'make abc        Build/update Berkeley ABC' \
 	  'make epfl       Fetch the 20 small EPFL AIGER circuits' \
@@ -46,6 +50,18 @@ analyze-full:
 	  --output-dir artifacts/analysis/epfl_full \
 	  --config configs/experiment.json
 
+analyze-live-ablation:
+	$(PYTHON) scripts/analyze_live.py \
+	  --results artifacts/live_validation/epfl_pilot_ablation/results.csv \
+	  --output-dir artifacts/analysis/live_epfl_pilot_ablation \
+	  --settings configs/live_validation_ablation_pilot.json
+
+analyze-live-repeat:
+	$(PYTHON) scripts/analyze_live.py \
+	  --results artifacts/live_validation/epfl_pilot_repeated/results.csv \
+	  --output-dir artifacts/analysis/live_epfl_pilot_repeated \
+	  --settings configs/live_validation_repeated_pilot.json
+
 ablation-pilot:
 	$(PYTHON) scripts/run_ablations.py --settings configs/ablation_pilot.json --resume
 
@@ -54,6 +70,12 @@ ablation-full:
 
 live-pilot:
 	$(PYTHON) scripts/validate_live.py --settings configs/live_validation_pilot.json --resume
+
+live-ablation-pilot:
+	$(PYTHON) scripts/validate_live.py --settings configs/live_validation_ablation_pilot.json --resume
+
+live-repeat-pilot:
+	$(PYTHON) scripts/validate_live.py --settings configs/live_validation_repeated_pilot.json --resume
 
 abc:
 	bash scripts/setup_abc.sh

@@ -174,3 +174,33 @@ ABC，並把 live best QoR 與相同 recipe shard 的 exhaustive oracle 對照�
 live output 與 offline output 分開保存，且每個 cell 都驗證 circuit、recipe、model
 signature。若 live 與 replay 差異很大，先檢查 ABC binary、檔案 provenance 與量測雜訊，
 再決定是否需要重新收集資料或訓練模型。
+
+Live runner 也支援同一個 cell 的策略比較與重複量測。六策略 pilot：
+
+    .venv/bin/python scripts/validate_live.py \
+      --settings configs/live_validation_ablation_pilot.json \
+      --resume
+
+重複三次的 timing-noise pilot：
+
+    .venv/bin/python scripts/validate_live.py \
+      --settings configs/live_validation_repeated_pilot.json \
+      --resume
+
+每個新版 artifact 都記錄 `method` 與 `repeat`，路徑為
+`<seed>/<circuit>/method_<name>/repeat_<index>/budget_*_search_*.json`；舊版單一
+risk-aware artifact 仍可在預設設定下續跑並被安全升級。`summary.json` 的
+`expected_runs` 會計入 methods 與 repeats，`results.csv` 則可直接依 method/repeat
+分組比較 `relative_gap_pct`、`live_wall_s` 與 early-stop 行為。
+
+使用 `scripts/analyze_live.py` 可稽核 CSV 格網並輸出 `report.json`、`report.md`。
+它會針對每個 method × budget 計算 gap/wall-time 的 bootstrap 95% CI，並在有
+`repeats >= 2` 時計算每個 live cell 的 wall-time coefficient of variation：
+
+    .venv/bin/python scripts/analyze_live.py \
+      --results artifacts/live_validation/epfl_pilot_repeated/results.csv \
+      --output-dir artifacts/analysis/live_epfl_pilot_repeated \
+      --settings configs/live_validation_repeated_pilot.json
+
+這份報告的 repeat 統計只描述目前硬體、ABC binary 與 circuit 的量測噪聲，不能
+直接外推到不同執行環境。

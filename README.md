@@ -32,6 +32,8 @@ logic-synthesis recipe，並以具校準區間的 surrogate model 同時決定�
   greedy、LCB-only、selection-only、early-stop-only 與完整 risk-aware policy。
 - 獨立的 live-ABC validation runner：使用已完成的 model/recipe artifacts，小規模驗證
   真實 ABC 與 offline replay 是否一致。
+- Live validation 支援六種策略與重複量測；每個 method × repeat × circuit × budget ×
+  search seed cell 都有獨立 checkpoint，可估計真實 ABC 的時間噪聲與策略差異。
 
 ## QoR 定義
 
@@ -97,6 +99,19 @@ runner 的輸出結構、checkpoint 判定與分階段指令請見
 checkpoint，可中斷後以 `--resume` 繼續。小規模 live ABC 驗證：
 
     make live-pilot
+
+比較六種策略的實際 ABC 行為（預設只跑 adder、budget 3）：
+
+    make live-ablation-pilot
+
+重複同一個 risk-aware cell 三次，以估計 ABC wall-time 變異：
+
+    make live-repeat-pilot
+
+live 結果可再產生策略／重複量測報告：
+
+    make analyze-live-ablation
+    make analyze-live-repeat
 
 live 結果獨立寫入 `artifacts/live_validation/`，不會覆蓋 offline simulation。
 
@@ -187,8 +202,9 @@ family shift 分層報告。
       cli.py           命令列入口
     scripts/
       analyze_results.py  格網稽核、bootstrap 統計、SVG 與 Markdown 報告
+      analyze_live.py     live ABC 策略比較與重複 timing-noise 報告
       run_ablations.py    可續跑 baseline/ablation sweep
-      validate_live.py    真實 ABC live validation
+      validate_live.py    真實 ABC live validation（策略與重複量測）
 
 ## 目前邊界
 

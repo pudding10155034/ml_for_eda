@@ -1,0 +1,20 @@
+{
+  "schema_version": 2,
+  "base_config": "pilot_experiment.json",
+  "experiment_dir": "artifacts/experiments/epfl_pilot_optimized",
+  "output_dir": "artifacts/live_validation/epfl_pilot_ablation",
+  "recipe_seed": 7,
+  "circuits": ["adder"],
+  "budgets": [3],
+  "search_seeds": [0],
+  "methods": [
+    "risk_aware",
+    "random",
+    "mean_greedy",
+    "lcb_only",
+    "selection_only",
+    "early_stop_only"
+  ],
+  "repeats": 1,
+  "min_stop_step": 2
+}
