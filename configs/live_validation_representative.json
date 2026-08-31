@@ -1,0 +1,13 @@
+{
+  "schema_version": 3,
+  "base_config": "experiment.json",
+  "experiment_dir": "artifacts/experiments/epfl_full",
+  "output_dir": "artifacts/live_validation/representative",
+  "recipe_seeds": [0, 7],
+  "circuits": ["adder", "multiplier", "sqrt", "cavlc", "router"],
+  "budgets": [10, 20, 50],
+  "search_seeds": [0, 1, 2],
+  "methods": ["risk_aware", "random"],
+  "repeats": 3,
+  "min_stop_step": 2
+}

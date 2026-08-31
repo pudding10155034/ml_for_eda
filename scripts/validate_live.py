@@ -30,7 +30,8 @@ from riskaware_eda.search import run_live_search
 from riskaware_eda.simulation import SEARCH_POLICIES, load_oracle_trajectories
 
 
-LIVE_SCHEMA_VERSION = 2
+LIVE_SCHEMA_VERSION = 3
+_SUPPORTED_LIVE_SCHEMAS = {1, 2, LIVE_SCHEMA_VERSION}
 _LEGACY_LIVE_SCHEMA_VERSION = 1
 _DEFAULT_METHOD = "risk_aware"
 
@@ -108,9 +109,49 @@ def _legacy_settings_fingerprint(values: Mapping[str, Any]) -> str:
     legacy = {
         key: value
         for key, value in values.items()
-        if key not in {"methods", "repeats", "settings_fingerprint"}
+        if key
+        not in {
+            "methods",
+            "repeats",
+            "recipe_seeds",
+            "settings_fingerprint",
+        }
     }
     return _settings_fingerprint(legacy)
+
+
+def _settings_recipe_seeds(settings: Mapping[str, Any]) -> list[int]:
+    """Read the new seed axis while accepting the schema-1 scalar alias."""
+
+    raw = settings.get("recipe_seeds")
+    if raw is None:
+        raw = [settings.get("recipe_seed")]
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        raise ValueError("recipe_seeds must be a list of integers")
+    seeds = [int(item) for item in raw]
+    if not seeds or len(seeds) != len(set(seeds)):
+        raise ValueError("recipe_seeds must be a non-empty unique list")
+    return seeds
+
+
+def _manifest_settings_fingerprints(
+    previous: Mapping[str, Any], current: Mapping[str, Any]
+) -> set[str]:
+    """Return fingerprints accepted while upgrading a compatible manifest."""
+
+    fingerprints = {
+        str(current["settings_fingerprint"]),
+        _legacy_settings_fingerprint(current),
+    }
+    previous_settings = previous.get("settings")
+    if isinstance(previous_settings, Mapping):
+        previous_core = {
+            key: value
+            for key, value in previous_settings.items()
+            if key != "settings_fingerprint"
+        }
+        fingerprints.add(_settings_fingerprint(previous_core))
+    return fingerprints
 
 
 def _settings_compatible(
@@ -118,30 +159,70 @@ def _settings_compatible(
 ) -> bool:
     if previous.get("settings_fingerprint") == current.get("settings_fingerprint"):
         return True
-    if previous.get("live_validation_schema_version") != _LEGACY_LIVE_SCHEMA_VERSION:
+    if previous.get("live_validation_schema_version") not in _SUPPORTED_LIVE_SCHEMAS:
         return False
-    # Schema 1 had exactly one implicit risk-aware run. Allow that output to
-    # resume and be upgraded in place, but never reinterpret it as a multi-policy
-    # or repeated experiment.
-    if current.get("methods") != [_DEFAULT_METHOD] or current.get("repeats") != 1:
+    # Older schemas had one implicit risk-aware run and one recipe seed. Allow
+    # that output to resume and be upgraded in place, but never reinterpret it
+    # as a multi-policy, repeated, or multi-seed experiment.
+    try:
+        current_seeds = _settings_recipe_seeds(current)
+    except (TypeError, ValueError):
+        return False
+    if (
+        current.get("methods") != [_DEFAULT_METHOD]
+        or current.get("repeats") != 1
+        or current_seeds != [current.get("recipe_seed")]
+    ):
         return False
     previous_settings = previous.get("settings")
     if not isinstance(previous_settings, Mapping):
         return False
+    previous_methods = previous_settings.get("methods", [_DEFAULT_METHOD])
+    previous_repeats = int(previous_settings.get("repeats", 1))
+    try:
+        previous_seeds = _settings_recipe_seeds(previous_settings)
+    except (TypeError, ValueError):
+        return False
+    if (
+        previous_methods != [_DEFAULT_METHOD]
+        or previous_repeats != 1
+        or previous_seeds != [current.get("recipe_seed")]
+    ):
+        return False
     previous_core = {
         key: value
         for key, value in previous_settings.items()
-        if key not in {"methods", "repeats", "settings_fingerprint"}
+        if key
+        not in {
+            "methods",
+            "repeats",
+            "recipe_seeds",
+            "settings_fingerprint",
+        }
     }
     current_core = {
         key: value
         for key, value in current.items()
-        if key not in {"methods", "repeats", "settings_fingerprint"}
+        if key
+        not in {
+            "methods",
+            "repeats",
+            "recipe_seeds",
+            "settings_fingerprint",
+        }
+    }
+    previous_full = {
+        key: value
+        for key, value in previous_settings.items()
+        if key != "settings_fingerprint"
     }
     return (
         previous_core == current_core
         and previous.get("settings_fingerprint")
-        == _settings_fingerprint(previous_core)
+        in {
+            _settings_fingerprint(previous_core),
+            _settings_fingerprint(previous_full),
+        }
     )
 
 
@@ -173,13 +254,31 @@ def _load_settings(args: argparse.Namespace) -> tuple[Any, dict[str, Any]]:
     repeats = int(
         args.repeats if args.repeats is not None else settings.get("repeats", 1)
     )
-    recipe_seed = int(args.recipe_seed if args.recipe_seed is not None else settings.get("recipe_seed", config.recipes.seeds[0]))
+    if args.recipe_seed is not None and args.recipe_seeds is not None:
+        raise ValueError("use either --recipe-seed or --recipe-seeds, not both")
+    if args.recipe_seeds is not None:
+        recipe_seeds = _split(args.recipe_seeds, int) or []
+    elif settings.get("recipe_seeds") is not None:
+        recipe_seeds = _settings_recipe_seeds(settings)
+    else:
+        recipe_seeds = [
+            int(
+                args.recipe_seed
+                if args.recipe_seed is not None
+                else settings.get("recipe_seed", config.recipes.seeds[0])
+            )
+        ]
+    recipe_seeds = sorted(set(int(item) for item in recipe_seeds))
+    if not recipe_seeds:
+        raise ValueError("at least one recipe seed is required")
+    recipe_seed = recipe_seeds[0] if len(recipe_seeds) == 1 else None
     values: dict[str, Any] = {
         "settings_source": str(settings_path) if settings_path else None,
         "base_config": str(base_config),
         "experiment_dir": str(source_root),
         "output_dir": str(output_root),
         "recipe_seed": recipe_seed,
+        "recipe_seeds": recipe_seeds,
         "circuits": [str(item) for item in circuits],
         "budgets": sorted({int(item) for item in budgets}),
         "search_seeds": sorted({int(item) for item in search_seeds}),
@@ -190,8 +289,13 @@ def _load_settings(args: argparse.Namespace) -> tuple[Any, dict[str, Any]]:
         "keep_workdir": bool(settings.get("keep_workdir", False)),
         "config_fingerprint": config.fingerprint,
     }
-    if values["recipe_seed"] not in config.recipes.seeds:
-        raise ValueError(f"recipe seed {values['recipe_seed']} is not in the base config")
+    unknown_recipe_seeds = sorted(
+        set(values["recipe_seeds"]) - set(config.recipes.seeds)
+    )
+    if unknown_recipe_seeds:
+        raise ValueError(
+            f"recipe seeds {unknown_recipe_seeds} are not in the base config"
+        )
     configured_circuits = {path.stem: path for path in config.circuits}
     missing = sorted(set(values["circuits"]) - set(configured_circuits))
     if missing:
@@ -234,6 +338,7 @@ def _artifact_complete(
     signatures: Mapping[str, Mapping[str, int]],
     *,
     legacy_settings_fingerprint: str | None = None,
+    compatible_settings_fingerprints: Sequence[str] = (),
 ) -> bool:
     if not path.is_file():
         return False
@@ -250,8 +355,9 @@ def _artifact_complete(
             and expected["repeat"] == 0
         ):
             fingerprints.add(legacy_settings_fingerprint)
+        fingerprints.update(str(item) for item in compatible_settings_fingerprints)
         return bool(
-            schema in {LIVE_SCHEMA_VERSION, _LEGACY_LIVE_SCHEMA_VERSION}
+            schema in _SUPPORTED_LIVE_SCHEMAS
             and payload.get("settings_fingerprint") in fingerprints
             and payload.get("recipe_seed") == expected["recipe_seed"]
             and payload.get("holdout_circuit") == expected["holdout_circuit"]
@@ -299,10 +405,7 @@ def _aggregate(root: Path, settings: Mapping[str, Any]) -> dict[str, Any]:
             payload = _read_json(path)
         except (OSError, ValueError, json.JSONDecodeError):
             continue
-        if payload.get("live_validation_schema_version") in {
-            LIVE_SCHEMA_VERSION,
-            _LEGACY_LIVE_SCHEMA_VERSION,
-        }:
+        if payload.get("live_validation_schema_version") in _SUPPORTED_LIVE_SCHEMAS:
             rows.append(_row(payload))
     rows.sort(
         key=lambda item: (
@@ -322,27 +425,23 @@ def _aggregate(root: Path, settings: Mapping[str, Any]) -> dict[str, Any]:
         writer.writeheader()
         writer.writerows(rows)
     temporary.replace(results_path)
+    expected_runs = (
+        len(_settings_recipe_seeds(settings))
+        * len(settings["circuits"])
+        * len(settings["budgets"])
+        * len(settings["search_seeds"])
+        * len(settings["methods"])
+        * int(settings["repeats"])
+    )
     summary = {
         "live_validation_schema_version": LIVE_SCHEMA_VERSION,
         "settings_fingerprint": settings["settings_fingerprint"],
         "runs": len(rows),
-        "expected_runs": (
-            len(settings["circuits"])
-            * len(settings["budgets"])
-            * len(settings["search_seeds"])
-            * len(settings["methods"])
-            * int(settings["repeats"])
-        ),
+        "expected_runs": expected_runs,
+        "recipe_seeds": _settings_recipe_seeds(settings),
         "methods": list(settings["methods"]),
         "repeats": int(settings["repeats"]),
-        "complete": len(rows)
-        == (
-            len(settings["circuits"])
-            * len(settings["budgets"])
-            * len(settings["search_seeds"])
-            * len(settings["methods"])
-            * int(settings["repeats"])
-        ),
+        "complete": len(rows) == expected_runs,
         "results": str(results_path),
         "finished_at": _utc_now(),
     }
@@ -360,10 +459,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         output_root.mkdir(parents=True, exist_ok=True)
     manifest_path = output_root / "manifest.json"
     legacy_settings_fingerprint = _legacy_settings_fingerprint(settings)
+    compatible_settings_fingerprints: set[str] = {
+        settings["settings_fingerprint"],
+        legacy_settings_fingerprint,
+    }
     if manifest_path.is_file():
         previous = _read_json(manifest_path)
         if not _settings_compatible(previous, settings):
             raise ValueError("live-validation output belongs to a different settings fingerprint")
+        compatible_settings_fingerprints.update(
+            _manifest_settings_fingerprints(previous, settings)
+        )
         if not args.resume and not args.dry_run:
             raise ValueError("live-validation output already exists; pass --resume to continue")
     elif output_root.exists() and any(
@@ -374,13 +480,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "source_experiment": str(source_root),
         "output_dir": str(output_root),
         "recipe_seed": settings["recipe_seed"],
+        "recipe_seeds": settings["recipe_seeds"],
         "circuits": settings["circuits"],
         "budgets": settings["budgets"],
         "search_seeds": settings["search_seeds"],
         "methods": settings["methods"],
         "repeats": settings["repeats"],
         "expected_runs": (
-            len(settings["circuits"])
+            len(settings["recipe_seeds"])
+            * len(settings["circuits"])
             * len(settings["budgets"])
             * len(settings["search_seeds"])
             * len(settings["methods"])
@@ -408,113 +516,145 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     completed = skipped = 0
     started = time.perf_counter()
     try:
-        recipe_path = source_root / "recipes" / f"{_seed_tag(settings['recipe_seed'])}.json"
-        recipes = load_recipes(recipe_path)
         runner = ABCRunner(config.abc, timeout_s=settings["timeout_s"], keep_workdir=settings["keep_workdir"])
         with _ExperimentLock(output_root / "run.lock"):
-            for circuit_id in settings["circuits"]:
-                circuit_path = next(path for path in config.circuits if path.stem == circuit_id)
-                model_path = source_root / "models" / _seed_tag(settings["recipe_seed"]) / f"holdout_{circuit_id}.joblib"
-                shard_path = source_root / "shards" / _seed_tag(settings["recipe_seed"]) / f"{circuit_id}.csv"
-                if not model_path.is_file() or not shard_path.is_file():
-                    raise FileNotFoundError(f"model/oracle artifacts missing for circuit={circuit_id}")
-                signatures = {
-                    "model": _file_signature(model_path),
-                    "recipe": _file_signature(recipe_path),
-                    "circuit": _file_signature(circuit_path),
-                }
-                oracle = load_oracle_trajectories(shard_path, circuit_id)
-                oracle_scores = {
-                    trajectory.recipe_id: normalized_qor(trajectory.current_stats, trajectory.initial)
-                    for trajectory in oracle
-                }
-                oracle_best_recipe_id = min(oracle_scores, key=oracle_scores.get)
-                oracle_best_qor = oracle_scores[oracle_best_recipe_id]
-                model = RiskModel.load(model_path)
-                legacy_layout = (
-                    settings["methods"] == [_DEFAULT_METHOD]
-                    and int(settings["repeats"]) == 1
+            for recipe_seed in settings["recipe_seeds"]:
+                recipe_path = (
+                    source_root
+                    / "recipes"
+                    / f"{_seed_tag(recipe_seed)}.json"
                 )
-                for method in settings["methods"]:
-                    policy = SEARCH_POLICIES[method]
-                    for repeat in range(int(settings["repeats"])):
-                        for search_seed in settings["search_seeds"]:
-                            for budget in settings["budgets"]:
-                                destination = _artifact_path(
-                                    output_root,
-                                    settings["recipe_seed"],
-                                    circuit_id,
-                                    budget,
-                                    search_seed,
-                                    method=method,
-                                    repeat=repeat,
-                                    legacy_layout=legacy_layout,
-                                )
-                                expected = {
-                                    "settings_fingerprint": settings["settings_fingerprint"],
-                                    "recipe_seed": settings["recipe_seed"],
-                                    "holdout_circuit": circuit_id,
-                                    "method": method,
-                                    "repeat": repeat,
-                                    "budget": budget,
-                                    "search_seed": search_seed,
-                                }
-                                if args.resume and _artifact_complete(
-                                    destination,
-                                    expected,
-                                    signatures,
-                                    legacy_settings_fingerprint=legacy_settings_fingerprint,
-                                ):
-                                    skipped += 1
-                                    continue
-                                started_cell = time.perf_counter()
-                                print(
-                                    "live validation: "
-                                    f"circuit={circuit_id} method={method} "
-                                    f"repeat={repeat} budget={budget} "
-                                    f"search_seed={search_seed}",
-                                    flush=True,
-                                )
-                                with runner.session(circuit_path) as session:
-                                    search = run_live_search(
-                                        model=model,
-                                        session=session,
-                                        recipes=recipes,
-                                        budget=budget,
-                                        seed=search_seed,
-                                        min_steps_before_stopping=settings["min_stop_step"],
-                                        selection=str(policy["selection"]),
-                                        safe_elimination=bool(policy["safe_elimination"]),
-                                        early_stopping=bool(policy["early_stopping"]),
+                if not recipe_path.is_file():
+                    raise FileNotFoundError(
+                        f"recipe artifact missing for recipe_seed={recipe_seed}: "
+                        f"{recipe_path}"
+                    )
+                recipes = load_recipes(recipe_path)
+                for circuit_id in settings["circuits"]:
+                    circuit_path = next(
+                        path for path in config.circuits if path.stem == circuit_id
+                    )
+                    model_path = (
+                        source_root
+                        / "models"
+                        / _seed_tag(recipe_seed)
+                        / f"holdout_{circuit_id}.joblib"
+                    )
+                    shard_path = (
+                        source_root
+                        / "shards"
+                        / _seed_tag(recipe_seed)
+                        / f"{circuit_id}.csv"
+                    )
+                    if not model_path.is_file() or not shard_path.is_file():
+                        raise FileNotFoundError(
+                            "model/oracle artifacts missing for "
+                            f"recipe_seed={recipe_seed}, circuit={circuit_id}"
+                        )
+                    signatures = {
+                        "model": _file_signature(model_path),
+                        "recipe": _file_signature(recipe_path),
+                        "circuit": _file_signature(circuit_path),
+                    }
+                    oracle = load_oracle_trajectories(shard_path, circuit_id)
+                    oracle_scores = {
+                        trajectory.recipe_id: normalized_qor(
+                            trajectory.current_stats, trajectory.initial
+                        )
+                        for trajectory in oracle
+                    }
+                    oracle_best_recipe_id = min(
+                        oracle_scores, key=oracle_scores.get
+                    )
+                    oracle_best_qor = oracle_scores[oracle_best_recipe_id]
+                    model = RiskModel.load(model_path)
+                    legacy_layout = (
+                        len(settings["recipe_seeds"]) == 1
+                        and settings["methods"] == [_DEFAULT_METHOD]
+                        and int(settings["repeats"]) == 1
+                    )
+                    for method in settings["methods"]:
+                        policy = SEARCH_POLICIES[method]
+                        for repeat in range(int(settings["repeats"])):
+                            for search_seed in settings["search_seeds"]:
+                                for budget in settings["budgets"]:
+                                    destination = _artifact_path(
+                                        output_root,
+                                        recipe_seed,
+                                        circuit_id,
+                                        budget,
+                                        search_seed,
+                                        method=method,
+                                        repeat=repeat,
+                                        legacy_layout=legacy_layout,
                                     )
-                                relative_gap = (
-                                    None
-                                    if search.best_qor is None
-                                    else 100.0
-                                    * (search.best_qor - oracle_best_qor)
-                                    / max(abs(oracle_best_qor), 1e-12)
-                                )
-                                _atomic_json(
-                                    {
-                                        "live_validation_schema_version": LIVE_SCHEMA_VERSION,
-                                        **expected,
-                                        "model": str(model_path),
-                                        "model_signature": signatures["model"],
-                                        "recipe": str(recipe_path),
-                                        "recipe_signature": signatures["recipe"],
-                                        "circuit": str(circuit_path),
-                                        "circuit_signature": signatures["circuit"],
-                                        "oracle": str(shard_path),
-                                        "oracle_best_recipe_id": oracle_best_recipe_id,
-                                        "oracle_best_qor": oracle_best_qor,
-                                        "relative_gap_pct": relative_gap,
-                                        "live_wall_s": time.perf_counter() - started_cell,
-                                        "search": search.to_dict(),
-                                        "finished_at": _utc_now(),
-                                    },
-                                    destination,
-                                )
-                                completed += 1
+                                    expected = {
+                                        "settings_fingerprint": settings["settings_fingerprint"],
+                                        "recipe_seed": recipe_seed,
+                                        "holdout_circuit": circuit_id,
+                                        "method": method,
+                                        "repeat": repeat,
+                                        "budget": budget,
+                                        "search_seed": search_seed,
+                                    }
+                                    if args.resume and _artifact_complete(
+                                        destination,
+                                        expected,
+                                        signatures,
+                                        legacy_settings_fingerprint=legacy_settings_fingerprint,
+                                        compatible_settings_fingerprints=compatible_settings_fingerprints,
+                                    ):
+                                        skipped += 1
+                                        continue
+                                    started_cell = time.perf_counter()
+                                    print(
+                                        "live validation: "
+                                        f"recipe_seed={recipe_seed} "
+                                        f"circuit={circuit_id} method={method} "
+                                        f"repeat={repeat} budget={budget} "
+                                        f"search_seed={search_seed}",
+                                        flush=True,
+                                    )
+                                    with runner.session(circuit_path) as session:
+                                        search = run_live_search(
+                                            model=model,
+                                            session=session,
+                                            recipes=recipes,
+                                            budget=budget,
+                                            seed=search_seed,
+                                            min_steps_before_stopping=settings["min_stop_step"],
+                                            selection=str(policy["selection"]),
+                                            safe_elimination=bool(policy["safe_elimination"]),
+                                            early_stopping=bool(policy["early_stopping"]),
+                                        )
+                                    relative_gap = (
+                                        None
+                                        if search.best_qor is None
+                                        else 100.0
+                                        * (search.best_qor - oracle_best_qor)
+                                        / max(abs(oracle_best_qor), 1e-12)
+                                    )
+                                    _atomic_json(
+                                        {
+                                            "live_validation_schema_version": LIVE_SCHEMA_VERSION,
+                                            **expected,
+                                            "model": str(model_path),
+                                            "model_signature": signatures["model"],
+                                            "recipe": str(recipe_path),
+                                            "recipe_signature": signatures["recipe"],
+                                            "circuit": str(circuit_path),
+                                            "circuit_signature": signatures["circuit"],
+                                            "oracle": str(shard_path),
+                                            "oracle_best_recipe_id": oracle_best_recipe_id,
+                                            "oracle_best_qor": oracle_best_qor,
+                                            "relative_gap_pct": relative_gap,
+                                            "live_wall_s": time.perf_counter() - started_cell,
+                                            "search": search.to_dict(),
+                                            "finished_at": _utc_now(),
+                                        },
+                                        destination,
+                                    )
+                                    completed += 1
         aggregate = _aggregate(output_root, settings)
         manifest["status"] = "complete"
         manifest["updated_at"] = _utc_now()
@@ -537,6 +677,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--experiment-dir", type=Path)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--recipe-seed", type=int)
+    parser.add_argument(
+        "--recipe-seeds",
+        help="comma-separated recipe seeds (mutually exclusive with --recipe-seed)",
+    )
     parser.add_argument("--circuits")
     parser.add_argument("--budgets")
     parser.add_argument("--search-seeds")

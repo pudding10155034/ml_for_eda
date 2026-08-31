@@ -175,7 +175,7 @@ live output 與 offline output 分開保存，且每個 cell 都驗證 circuit�
 signature。若 live 與 replay 差異很大，先檢查 ABC binary、檔案 provenance 與量測雜訊，
 再決定是否需要重新收集資料或訓練模型。
 
-Live runner 也支援同一個 cell 的策略比較與重複量測。六策略 pilot：
+Live runner 也支援同一個 cell 的策略比較、重複量測與多個 recipe seed。六策略 pilot：
 
     .venv/bin/python scripts/validate_live.py \
       --settings configs/live_validation_ablation_pilot.json \
@@ -190,8 +190,18 @@ Live runner 也支援同一個 cell 的策略比較與重複量測。六策略 p
 每個新版 artifact 都記錄 `method` 與 `repeat`，路徑為
 `<seed>/<circuit>/method_<name>/repeat_<index>/budget_*_search_*.json`；舊版單一
 risk-aware artifact 仍可在預設設定下續跑並被安全升級。`summary.json` 的
-`expected_runs` 會計入 methods 與 repeats，`results.csv` 則可直接依 method/repeat
-分組比較 `relative_gap_pct`、`live_wall_s` 與 early-stop 行為。
+`expected_runs` 會計入 recipe seeds、methods 與 repeats，`results.csv` 則可直接依
+recipe seed/method/repeat 分組比較 `relative_gap_pct`、`live_wall_s` 與 early-stop
+行為。
+
+多 recipe seed 會使用相同的 seed tag 目錄配置，例如：
+
+    .venv/bin/python scripts/validate_live.py \
+      --settings configs/live_validation_representative.json \
+      --resume
+
+設定檔中的 `recipe_seeds` 必須存在於 base experiment 的 `recipes.seeds`；每個 seed
+都會獨立驗證 recipe、model、oracle 與 circuit signature，任一 seed 中斷後可單獨續跑。
 
 使用 `scripts/analyze_live.py` 可稽核 CSV 格網並輸出 `report.json`、`report.md`。
 它會針對每個 method × budget 計算 gap/wall-time 的 bootstrap 95% CI，並在有

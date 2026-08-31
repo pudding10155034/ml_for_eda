@@ -77,7 +77,28 @@ def test_live_settings_accept_methods_and_repeats(tmp_path):
     assert config.name == "live-test"
     assert values["methods"] == ["random", "risk_aware"]
     assert values["repeats"] == 3
+    assert values["recipe_seeds"] == [7]
     assert len(values["settings_fingerprint"]) == 64
+
+
+def test_live_settings_accept_multiple_recipe_seeds_from_cli(tmp_path):
+    base = _write_base_config(tmp_path)
+    # Add a second configured seed to the base experiment.
+    payload = json.loads(base.read_text(encoding="utf-8"))
+    payload["recipes"]["seeds"] = [3, 7]
+    base.write_text(json.dumps(payload), encoding="utf-8")
+    (tmp_path / "source").mkdir()
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps({"base_config": base.name, "experiment_dir": "source"}),
+        encoding="utf-8",
+    )
+    args = build_parser().parse_args(
+        ["--settings", str(settings_path), "--recipe-seeds", "7,3"]
+    )
+    _, values = _load_settings(args)
+    assert values["recipe_seeds"] == [3, 7]
+    assert values["recipe_seed"] is None
 
 
 def test_live_dry_run_does_not_create_output_directory(tmp_path):
@@ -162,6 +183,8 @@ def test_artifact_layout_and_legacy_schema_resume(tmp_path):
 def test_aggregate_counts_method_and_repeat(tmp_path):
     settings = {
         "settings_fingerprint": "settings",
+        "recipe_seed": 7,
+        "recipe_seeds": [7],
         "circuits": ["c0"],
         "budgets": [2],
         "search_seeds": [0],
@@ -222,12 +245,14 @@ def test_schema_one_default_manifest_is_compatible():
         "live_validation_schema_version": 1,
         "settings": {
             "a": 1,
+            "recipe_seed": 0,
             "settings_fingerprint": "ignored",
         },
         "settings_fingerprint": "8a4c3e1b34f423a6b2b3a9f7d22d2f7b1d7343c9d7393f4e5ed8f3a0de9b9b37",
     }
     current = {
         "a": 1,
+        "recipe_seed": 0,
         "methods": ["risk_aware"],
         "repeats": 1,
         "settings_fingerprint": "different",
@@ -235,5 +260,32 @@ def test_schema_one_default_manifest_is_compatible():
     # Use the implementation's fingerprint to avoid depending on a literal hash.
     from scripts.validate_live import _settings_fingerprint
 
-    previous["settings_fingerprint"] = _settings_fingerprint({"a": 1})
+    previous["settings_fingerprint"] = _settings_fingerprint(
+        {"a": 1, "recipe_seed": 0}
+    )
+    assert _settings_compatible(previous, current)
+
+
+def test_schema_two_single_seed_manifest_migrates():
+    from scripts.validate_live import _settings_fingerprint
+
+    previous_settings = {
+        "a": 1,
+        "recipe_seed": 7,
+        "methods": ["risk_aware"],
+        "repeats": 1,
+    }
+    previous = {
+        "live_validation_schema_version": 2,
+        "settings": previous_settings,
+        "settings_fingerprint": _settings_fingerprint(previous_settings),
+    }
+    current = {
+        "a": 1,
+        "recipe_seed": 7,
+        "recipe_seeds": [7],
+        "methods": ["risk_aware"],
+        "repeats": 1,
+        "settings_fingerprint": "different",
+    }
     assert _settings_compatible(previous, current)

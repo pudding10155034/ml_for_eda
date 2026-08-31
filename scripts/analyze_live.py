@@ -133,9 +133,14 @@ def _settings_axes(settings_path: str | Path | None) -> dict[str, Any] | None:
         raise ValueError(
             "live settings must include non-empty circuits, budgets, and search_seeds"
         )
+    recipe_seeds = payload.get("recipe_seeds")
+    if recipe_seeds is None:
+        recipe_seeds = [payload.get("recipe_seed", 0)]
+    if not isinstance(recipe_seeds, list) or not recipe_seeds:
+        raise ValueError("live settings recipe_seeds must be a non-empty list")
     return {
         "methods": [str(item) for item in methods],
-        "recipe_seeds": [int(payload.get("recipe_seed", 0))],
+        "recipe_seeds": [int(item) for item in recipe_seeds],
         "circuits": [str(item) for item in circuits],
         "budgets": [int(item) for item in budgets],
         "search_seeds": [int(item) for item in search_seeds],
